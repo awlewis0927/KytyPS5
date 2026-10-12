@@ -16,6 +16,20 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// The SRT walker evaluates resource-table loads on the host. Titles can leave a table
+// pointer at 0 until it is first bound (Astro Bot PPSA21567 does this), so an unguarded
+// host read of base+offset faults in the null page. The GPU sees zeros for such a table
+// (every descriptor reads as null), so mirror that instead of touching host memory.
+constexpr uint64_t MinHostReadableAddress = 0x10000ull;
+
+bool IsHostReadable(uint64_t address, size_t size) {
+	return address >= MinHostReadableAddress && size <= ~uint64_t {0} - address;
+}
+
+} // namespace
+
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
@@ -39,6 +53,10 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
+		if (!IsHostReadable(address, values.size_bytes())) {
+			std::fill(values.begin(), values.end(), 0u);
+			return true;
+		}
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
@@ -691,7 +709,9 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		if (IsHostReadable(address, sizeof(word))) {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
 	}
 	result = word;
 	return true;
