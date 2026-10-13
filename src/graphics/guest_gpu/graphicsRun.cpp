@@ -446,6 +446,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	PerfStats::StartThreadSampler();
 
 	for (;;) {
 		Submission                   submission;
