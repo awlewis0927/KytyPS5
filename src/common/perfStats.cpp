@@ -162,8 +162,10 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 		if (g_file != nullptr) {
 			std::fprintf(g_file,
 			             "# per-interval totals; times in ms (wall time summed across threads)\n"
-			             "# tweaks: async_readback=%d\n",
-			             TweakEnabled("async_readback", true) ? 1 : 0);
+			             "# tweaks: async_readback=%d meta_readback_rt=%d meta_readback_tex=%d\n",
+			             TweakEnabled("async_readback", true) ? 1 : 0,
+			             TweakEnabled("meta_readback_rt", true) ? 1 : 0,
+			             TweakEnabled("meta_readback_tex", true) ? 1 : 0);
 		}
 		g_last_frames = presented_frames;
 	}
@@ -198,6 +200,8 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	const auto draws         = Take(Counter::Draws);
 	const auto dispatches    = Take(Counter::Dispatches);
 	const auto retries       = Take(Counter::ReadbackRetries);
+	const auto meta_reads    = Take(Counter::MetaReadbacks);
+	const auto meta_skips    = Take(Counter::MetaReadbackSkips);
 
 	if (g_file == nullptr) {
 		return;
@@ -207,7 +211,8 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             "readback n=%llu guest-blocked=%llu gpu-wait=%llu | finish=%llu sched-wait=%llu "
 	             "stream=%llu faultbuf=%llu | flip-slot=%llu | shaders n=%llu %llums | "
 	             "faults r=%llu w=%llu %llums | async-wait=%llu retries=%llu | draw n=%llu %llums "
-	             "dispatch n=%llu %llums | pipeline=%llu bufsync=%llu texfind=%llu\n",
+	             "dispatch n=%llu %llums | pipeline=%llu bufsync=%llu texfind=%llu | "
+	             "meta read=%llu skip=%llu\n",
 	             static_cast<double>(g_total_ms) / 1000.0,
 	             static_cast<unsigned long long>(elapsed_ms), fps,
 	             static_cast<unsigned long long>(gpu_busy), static_cast<unsigned long long>(gpu_idle),
@@ -230,7 +235,9 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(dispatch),
 	             static_cast<unsigned long long>(pipeline),
 	             static_cast<unsigned long long>(buffer_sync),
-	             static_cast<unsigned long long>(texture_find));
+	             static_cast<unsigned long long>(texture_find),
+	             static_cast<unsigned long long>(meta_reads),
+	             static_cast<unsigned long long>(meta_skips));
 	std::fflush(g_file);
 }
 

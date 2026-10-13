@@ -40,6 +40,8 @@ enum class Counter : uint32_t {
 	Draws,
 	Dispatches,
 	ReadbackRetries,
+	MetaReadbacks,
+	MetaReadbackSkips,
 	Count
 };
 
