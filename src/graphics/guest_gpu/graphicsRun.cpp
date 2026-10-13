@@ -914,6 +914,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	if (draw_count == 0) {
 		return;
 	}
+	PerfStats::Add(PerfStats::Counter::IndirectDraws, draw_count);
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
