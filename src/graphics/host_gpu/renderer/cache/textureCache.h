@@ -13,8 +13,10 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,8 +82,24 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Called by the buffer cache whenever the GPU is about to write a guest range. Forgets GPU
+	// clear detections of color metadata inside it, so the next binding detects again.
+	void NoteGpuBufferWrite(uint64_t address, uint64_t size);
 
 private:
+	// A metadata range already scanned (and consumed) by the GPU clear detector with no GPU
+	// write to it since. Binding it again with the same view and candidate colors would
+	// produce no new clear, so the detection is skipped.
+	struct GpuMetaDetection {
+		uint64_t                                               size         = 0;
+		ImageId                                                image        = {};
+		uint32_t                                               image_first  = 0;
+		uint32_t                                               count        = 0;
+		uint32_t                                               base_level   = 0;
+		vk::Format                                             format       = {};
+		uint32_t                                               enabled_mask = 0;
+		std::array<vk::ClearColorValue, MetaClearDetector::Candidates> colors {};
+	};
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
@@ -192,6 +210,9 @@ private:
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 	std::unique_ptr<MetaClearDetector> m_meta_clear;
+	std::mutex                              m_gpu_meta_lock;
+	std::map<uint64_t, GpuMetaDetection>    m_gpu_meta_done;
+	uint64_t                                m_gpu_meta_max_size = 0;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

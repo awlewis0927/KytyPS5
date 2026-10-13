@@ -1113,18 +1113,49 @@ bool TextureCache::TryGpuColorClear(ImageId id, const ImageDesc& desc, uint64_t 
 			enabled_mask |= 1u << k;
 		}
 	}
-	PerfStats::Add(PerfStats::Counter::MetaGpuDetections);
 	if (enabled_mask == 0) {
 		// No metadata value could produce a clear for this binding; the CPU path would not
 		// clear or consume anything either.
 		return true;
 	}
 
-	const bool consume = desc.type != BindingType::VideoOut;
+	const bool       consume = desc.type != BindingType::VideoOut;
+	GpuMetaDetection detection {};
+	detection.size         = slice_size * count;
+	detection.image        = id;
+	detection.image_first  = image_first;
+	detection.count        = count;
+	detection.base_level   = view.base_level;
+	detection.format       = view.format;
+	detection.enabled_mask = enabled_mask;
+	detection.colors       = colors;
+	const auto same_detection = [](const GpuMetaDetection& a, const GpuMetaDetection& b) {
+		return a.size == b.size && a.image == b.image && a.image_first == b.image_first &&
+		       a.count == b.count && a.base_level == b.base_level && a.format == b.format &&
+		       a.enabled_mask == b.enabled_mask &&
+		       std::memcmp(a.colors.data(), b.colors.data(), sizeof(a.colors)) == 0;
+	};
+	if (consume) {
+		std::scoped_lock meta_lock {m_gpu_meta_lock};
+		const auto       done = m_gpu_meta_done.find(first_slice_address);
+		if (done != m_gpu_meta_done.end() && same_detection(done->second, detection)) {
+			// Already scanned and consumed with no GPU write since: nothing new to clear.
+			PerfStats::Add(PerfStats::Counter::MetaGpuCached);
+			return true;
+		}
+	}
+	PerfStats::Add(PerfStats::Counter::MetaGpuDetections);
+
 	auto [meta, meta_offset] =
 	    m_buffer_cache.ObtainBuffer(first_slice_address, slice_size * count, consume, false);
 	if (meta == nullptr || meta_offset % 4 != 0) {
 		return false;
+	}
+	if (consume) {
+		// Recorded after ObtainBuffer, whose own write notification clears stale entries.
+		std::scoped_lock meta_lock {m_gpu_meta_lock};
+		m_gpu_meta_done[first_slice_address] = detection;
+		m_gpu_meta_max_size = std::max(m_gpu_meta_max_size, detection.size);
 	}
 
 	if (!m_meta_clear) {
@@ -1192,6 +1223,23 @@ bool TextureCache::TryGpuColorClear(ImageId id, const ImageDesc& desc, uint64_t 
 	native.endRendering();
 	CommitGpuWrite(image);
 	return true;
+}
+
+void TextureCache::NoteGpuBufferWrite(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_gpu_meta_lock};
+	if (m_gpu_meta_done.empty() || size == 0) {
+		return;
+	}
+	const auto end   = address + size;
+	const auto first = address > m_gpu_meta_max_size ? address - m_gpu_meta_max_size : 0;
+	for (auto it = m_gpu_meta_done.lower_bound(first);
+	     it != m_gpu_meta_done.end() && it->first < end;) {
+		if (it->first + it->second.size > address) {
+			it = m_gpu_meta_done.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
