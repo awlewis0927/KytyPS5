@@ -205,6 +205,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	const auto meta_reads    = Take(Counter::MetaReadbacks);
 	const auto meta_skips    = Take(Counter::MetaReadbackSkips);
 	const auto meta_gpu      = Take(Counter::MetaGpuDetections);
+	const auto meta_cached   = Take(Counter::MetaGpuCached);
 	const auto srt           = TakeMs(Timer::SrtMaterialize);
 	const auto pipe_state    = TakeMs(Timer::PipelineState);
 	const auto bindings      = TakeMs(Timer::Bindings);
@@ -222,7 +223,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             "stream=%llu faultbuf=%llu | flip-slot=%llu | shaders n=%llu %llums | "
 	             "faults r=%llu w=%llu %llums | async-wait=%llu retries=%llu | draw n=%llu %llums "
 	             "dispatch n=%llu %llums | pipeline=%llu bufsync=%llu texfind=%llu | "
-	             "meta read=%llu skip=%llu gpu=%llu | srt=%llu pipe=%llu bind=%llu rt=%llu "
+	             "meta read=%llu skip=%llu gpu=%llu cached=%llu | srt=%llu pipe=%llu bind=%llu rt=%llu "
 	             "commit=%llu | unmap-drain=%llu indirect=%llu\n",
 	             static_cast<double>(g_total_ms) / 1000.0,
 	             static_cast<unsigned long long>(elapsed_ms), fps,
@@ -249,7 +250,8 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(texture_find),
 	             static_cast<unsigned long long>(meta_reads),
 	             static_cast<unsigned long long>(meta_skips),
-	             static_cast<unsigned long long>(meta_gpu), static_cast<unsigned long long>(srt),
+	             static_cast<unsigned long long>(meta_gpu),
+	             static_cast<unsigned long long>(meta_cached), static_cast<unsigned long long>(srt),
 	             static_cast<unsigned long long>(pipe_state),
 	             static_cast<unsigned long long>(bindings), static_cast<unsigned long long>(targets),
 	             static_cast<unsigned long long>(commit),

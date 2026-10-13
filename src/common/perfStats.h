@@ -48,6 +48,7 @@ enum class Counter : uint32_t {
 	MetaReadbacks,
 	MetaReadbackSkips,
 	MetaGpuDetections,
+	MetaGpuCached, // GPU clear detections skipped because the metadata was unchanged
 	UnmapDrains,   // guest unmaps that forced a full GPU drain
 	IndirectDraws, // draws whose arguments were read from guest memory on the CPU
 	Count
