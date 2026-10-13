@@ -1095,6 +1095,18 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		// Reading GPU-written metadata back drains the whole GPU queue on the GPU thread. The
+		// optional tweaks skip clear detection for such metadata instead (no clear is applied),
+		// trading possible stale render-target contents for throughput.
+		static const bool readback_rt  = PerfStats::TweakEnabled("meta_readback_rt", true);
+		static const bool readback_tex = PerfStats::TweakEnabled("meta_readback_tex", true);
+		const bool        render_target =
+		    desc.type == BindingType::RenderTarget || desc.type == BindingType::VideoOut;
+		if (!(render_target ? readback_rt : readback_tex)) {
+			PerfStats::Add(PerfStats::Counter::MetaReadbackSkips);
+			return;
+		}
+		PerfStats::Add(PerfStats::Counter::MetaReadbacks);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
