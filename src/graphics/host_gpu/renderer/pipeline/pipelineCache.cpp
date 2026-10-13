@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/perfStats.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -294,6 +295,8 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code) {
+		PerfStats::Add(PerfStats::Counter::ShaderCompiles);
+		PerfStats::ScopedTimer compile_timer(PerfStats::Timer::ShaderCompile);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
