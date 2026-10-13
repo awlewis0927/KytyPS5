@@ -1,4 +1,5 @@
 #include "graphics/presentation/window.h"
+#include "common/perfStats.h"
 
 #include <SDL3/SDL.h>
 
@@ -756,6 +757,7 @@ void WindowContext::Run() {
 			if (frames != 0) {
 				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
 				                        static_cast<double>(elapsed));
+				PerfStats::Report(frames, elapsed);
 			}
 			title_time   = now;
 			title_frames = frames;
