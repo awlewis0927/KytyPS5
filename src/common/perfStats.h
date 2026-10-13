@@ -71,6 +71,8 @@ void NoteReadbackStack(bool gpu_thread) noexcept;
 // _perf.log under the interval's line, to identify what memory threads keep waiting on.
 enum class HotKind : uint32_t { GuestReadback, GpuReadback, WriteFault, Count };
 void NoteHotAddress(HotKind kind, uint64_t address) noexcept;
+// Large GPU-written buffer bindings (they mark the whole range GPU-owned), keyed by base address.
+void NoteWrittenRange(uint64_t address, uint64_t size) noexcept;
 
 // Called by the window thread about once per second with the presented frame total.
 void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept;

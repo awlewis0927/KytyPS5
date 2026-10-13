@@ -179,6 +179,41 @@ void WriteHotPages(FILE* file) {
 }
 } // namespace
 
+struct WrittenRange {
+	uint64_t size  = 0;
+	uint32_t count = 0;
+};
+std::unordered_map<uint64_t, WrittenRange> g_written_ranges;
+
+void WriteWrittenRanges(FILE* file) {
+	std::lock_guard lock(g_hot_mutex);
+	if (g_written_ranges.empty()) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, WrittenRange>> sorted(g_written_ranges.begin(),
+	                                                      g_written_ranges.end());
+	const auto top = (std::min<size_t>)(sorted.size(), 6);
+	std::partial_sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(top),
+	                  sorted.end(), [](const auto& a, const auto& b) {
+		                  return a.second.size > b.second.size;
+	                  });
+	std::fprintf(file, "    hot gpu-written-range ranges=%zu:", g_written_ranges.size());
+	for (size_t i = 0; i < top; i++) {
+		std::fprintf(file, " %llx+%llx*%u", static_cast<unsigned long long>(sorted[i].first),
+		             static_cast<unsigned long long>(sorted[i].second.size),
+		             sorted[i].second.count);
+	}
+	std::fprintf(file, "\n");
+	g_written_ranges.clear();
+}
+
+void NoteWrittenRange(uint64_t address, uint64_t size) noexcept {
+	std::lock_guard lock(g_hot_mutex);
+	auto& range = g_written_ranges[address];
+	range.size  = (std::max)(range.size, size);
+	range.count++;
+}
+
 void NoteHotAddress(HotKind kind, uint64_t address) noexcept {
 	const auto thread = CurrentThreadId();
 	std::lock_guard lock(g_hot_mutex);
@@ -318,6 +353,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(async_pipes),
 	             static_cast<unsigned long long>(async_skips));
 	WriteHotPages(g_file);
+	WriteWrittenRanges(g_file);
 	std::fflush(g_file);
 }
 
