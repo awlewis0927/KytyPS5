@@ -158,6 +158,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	const bool track_pending = m_track_pending;
+	if (track_pending) {
+		std::scoped_lock pending_lock(m_pending_publish_mutex);
+		for (const auto& copy: copies) {
+			m_pending_publish.Add(buffer_address + copy.srcOffset, copy.size);
+		}
+	}
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -200,12 +207,18 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
+	auto publish = [this, mapped, offset, total_size, buffer_address, track_pending,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+		if (track_pending) {
+			std::scoped_lock pending_lock(m_pending_publish_mutex);
+			for (const auto& copy: copies) {
+				m_pending_publish.Subtract(buffer_address + copy.srcOffset, copy.size);
+			}
 		}
 	};
 	if constexpr (async) {
@@ -234,7 +247,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
-	m_async_readback = PerfStats::TweakEnabled("async_readback", true);
+	m_async_readback   = PerfStats::TweakEnabled("async_readback", true);
+	m_relax_edge_pages = PerfStats::TweakEnabled("relax_edge_pages", false);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -295,6 +309,33 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto page_begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto page_size  = ((vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1)) -
 	                       page_begin;
+	if (m_relax_edge_pages) {
+		bool relaxed = false;
+		gpu.SendCommandSync([&] {
+			// Only when the faulting bytes themselves are not GPU-owned: the page is merely shared
+			// with GPU-written data (typically the tail of a GPU buffer next to CPU variables).
+			if (m_inflight_readbacks.Intersects(page_begin, page_size) ||
+			    m_gpu_modified_ranges.Intersects(vaddr, size) ||
+			    (is_write && !IsRegionRegistered(vaddr, size))) {
+				return;
+			}
+			if (m_gpu_modified_ranges.Intersects(page_begin, page_size)) {
+				auto& buffer    = m_slot_buffers[FindBuffer(page_begin, page_size)];
+				m_track_pending = true;
+				(void)DownloadBufferMemory<true>(buffer, page_begin, page_size);
+				m_track_pending = false;
+			}
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			PerfStats::Add(PerfStats::Counter::RelaxedFaults);
+			relaxed = true;
+		});
+		if (relaxed) {
+			return;
+		}
+	}
 	if (!m_async_readback || GuestGpu::IsGpuThread()) {
 		gpu.SendCommandSync([this, vaddr, size, is_write, page_begin, page_size] {
 			if (m_inflight_readbacks.Intersects(page_begin, page_size)) {
@@ -493,6 +534,25 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    if (m_relax_edge_pages) {
+			    // Skip bytes whose newer GPU contents are still being published to guest memory.
+			    std::scoped_lock pending_lock(m_pending_publish_mutex);
+			    if (m_pending_publish.Intersects(address, bytes)) {
+				    uint64_t cursor = address;
+				    m_pending_publish.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+					    if (start > cursor) {
+						    copies.emplace_back(total_size, buffer.Offset(cursor), start - cursor);
+						    total_size += start - cursor;
+					    }
+					    cursor = end;
+				    });
+				    if (address + bytes > cursor) {
+					    copies.emplace_back(total_size, buffer.Offset(cursor), address + bytes - cursor);
+					    total_size += address + bytes - cursor;
+				    }
+				    return;
+			    }
+		    }
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },

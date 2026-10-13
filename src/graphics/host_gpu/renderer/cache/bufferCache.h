@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -134,6 +135,14 @@ private:
 	// Ranges whose asynchronous readback is recorded but not yet published (GPU thread only).
 	RangeSet                                          m_inflight_readbacks;
 	bool                                              m_async_readback = true;
+	// "relax_edge_pages": a CPU access to bytes the GPU does not own, on a page that also holds
+	// GPU-written bytes, publishes those GPU bytes asynchronously instead of stalling the thread.
+	bool                                              m_relax_edge_pages = false;
+	bool                                              m_track_pending    = false;
+	// GPU-owned bytes whose asynchronous publish to guest memory is still pending; uploads skip
+	// them so stale CPU copies never overwrite newer GPU data.
+	std::mutex                                        m_pending_publish_mutex;
+	RangeSet                                          m_pending_publish;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
