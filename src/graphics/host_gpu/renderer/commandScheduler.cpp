@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/perfStats.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -186,13 +187,17 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	{
+		PerfStats::ScopedTimer finish_timer(PerfStats::Timer::SchedulerFinish);
+		m_master.Wait(CurrentTick() - 1);
+	}
 	BeginNext();
 	PopPendingOperations();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
+	PerfStats::ScopedTimer wait_timer(PerfStats::Timer::SchedulerWait);
 	if (tick == CurrentTick()) {
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to

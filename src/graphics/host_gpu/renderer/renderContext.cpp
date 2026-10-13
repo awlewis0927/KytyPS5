@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/perfStats.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -61,6 +62,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	PerfStats::Add(access == PageFaultAccess::Write ? PerfStats::Counter::WriteFaults
+	                                                : PerfStats::Counter::ReadFaults);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
