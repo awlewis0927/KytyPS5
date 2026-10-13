@@ -8,9 +8,18 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
@@ -107,11 +116,19 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 
+	// Result slot of a graphics pipeline compiled on a worker thread.
+	struct AsyncPipelineResult {
+		std::atomic<bool> done {false};
+		vk::Pipeline      pipeline = nullptr;
+	};
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Set while the pipeline compiles in the background; `pipeline` is null until then.
+		std::shared_ptr<AsyncPipelineResult> pending;
 	};
 
 	struct GraphicsPrograms {
@@ -137,7 +154,7 @@ public:
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              const GraphicsPrograms& programs, bool allow_async = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -178,7 +195,60 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
+	void WriteDriverCache(bool destroy);
+	void StartWorkers();
+	void StopWorkers();
+	void WaitWorkersIdle();
+	void WorkerLoop();
+
+	// Background graphics pipeline compilation (tweak "async_pipelines").
+	bool                              m_async_enabled = false;
+	std::vector<std::thread>          m_workers;
+	std::mutex                        m_jobs_mutex;
+	std::condition_variable           m_jobs_cv;
+	std::condition_variable           m_idle_cv;
+	std::deque<std::function<void()>> m_jobs;
+	uint32_t                          m_jobs_running = 0;
+	bool                              m_workers_stop = false;
+	// Periodic driver-cache checkpoints, so a killed session keeps its compiled pipelines.
+	uint32_t                          m_new_pipelines_since_save = 0;
+	std::chrono::steady_clock::time_point m_last_save = std::chrono::steady_clock::now();
 };
+
+// Everything vkCreateGraphicsPipelines needs, captured by value on the GPU thread so the
+// creation itself can run on a worker.
+struct GraphicsPipelineBuild {
+	std::array<vk::PipelineShaderStageCreateInfo, 4>                       stages {};
+	uint32_t                                                               stage_count = 0;
+	vk::ShaderModule                                                       tess_control = nullptr;
+	vk::ShaderModule                                                       tess_eval    = nullptr;
+	std::array<vk::VertexInputAttributeDescription, ShaderVertexInputInfo::RES_MAX> attributes {};
+	std::array<vk::VertexInputBindingDescription, ShaderVertexInputInfo::RES_MAX>   bindings {};
+	uint32_t                                                               attribute_count = 0;
+	uint32_t                                                               binding_count   = 0;
+	bool                                                                   mesh         = false;
+	bool                                                                   rect_list    = false;
+	bool                                                                   tessellation = false;
+	bool                                                                   with_depth   = false;
+	bool                                                                   ps_active    = false;
+	uint32_t                                                               patch_control_points = 3;
+	uint64_t                                                               vs_id = 0;
+	uint64_t                                                               ps_id = 0;
+	PipelineRenderingState                                                 rendering;
+	PipelineStaticParameters                                               static_params;
+	vk::PipelineLayout                                                     layout = nullptr;
+};
+
+void PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                             const PipelineRenderingState&          rendering,
+                             const PipelineVertexInputState&        vertex_input,
+                             std::span<const ShaderVertexInputInfo> vertex_info,
+                             const ShaderPixelInputInfo*            ps_input_info,
+                             const PipelineCache::GraphicsPrograms& programs,
+                             const PipelineStaticParameters&        static_params,
+                             GraphicsPipelineBuild&                 build);
+vk::Pipeline BuildGraphicsPipeline(GraphicContext& graphics, const GraphicsPipelineBuild& build,
+                                   vk::PipelineCache driver_cache);
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

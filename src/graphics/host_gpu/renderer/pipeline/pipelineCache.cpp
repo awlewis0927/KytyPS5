@@ -83,6 +83,24 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
+// The emulator revision is part of the signature, but the driver validates its own data and
+// keys pipelines by their SPIR-V, so a cache from another build of the same title stays
+// usable: compare everything except the revision field.
+bool DriverCacheSignatureMatches(std::string_view cached, std::string_view current) {
+	if (cached.size() != current.size()) {
+		return false;
+	}
+	const auto strip = [](std::string_view s) -> std::pair<std::string_view, std::string_view> {
+		const auto first  = s.find(':');
+		const auto second = first == std::string_view::npos ? first : s.find(':', first + 1);
+		if (second == std::string_view::npos) {
+			return {s, {}};
+		}
+		return {s.substr(0, first), s.substr(second)};
+	};
+	return strip(cached) == strip(current);
+}
+
 std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
@@ -484,13 +502,21 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	m_async_enabled = PerfStats::TweakEnabled("async_pipelines", false);
+	if (m_async_enabled) {
+		StartWorkers();
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	StopWorkers();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
+			if (pipeline->pending && pipeline->pending->done.load(std::memory_order_acquire)) {
+				m_graphics.device.destroyPipeline(pipeline->pending->pipeline, nullptr);
+			}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
@@ -551,7 +577,8 @@ void PipelineCache::InitializeDriverCache() {
 			          &payload_read);
 			file.Close();
 			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
+			    payload_read != initial_data.size() ||
+			    !DriverCacheSignatureMatches(cached_signature, signature) ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
@@ -589,10 +616,68 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+void PipelineCache::StartWorkers() {
+	const auto hardware = (std::max)(2u, std::thread::hardware_concurrency());
+	// Leave room for the GPU thread, the guest's own threads and the window thread.
+	const auto count = (std::clamp)(hardware / 2u - 1u, 1u, 6u);
+	m_workers_stop   = false;
+	for (uint32_t i = 0; i < count; i++) {
+		m_workers.emplace_back([this] { WorkerLoop(); });
+	}
+	Log::WriteToConsoleAndLog(
+	    fmt::format("Pipelines: compiling graphics pipelines on {} background threads.\n", count));
+}
+
+void PipelineCache::StopWorkers() {
+	{
+		std::scoped_lock lock(m_jobs_mutex);
+		m_workers_stop = true;
+	}
+	m_jobs_cv.notify_all();
+	for (auto& worker: m_workers) {
+		worker.join();
+	}
+	m_workers.clear();
+}
+
+void PipelineCache::WaitWorkersIdle() {
+	std::unique_lock lock(m_jobs_mutex);
+	m_idle_cv.wait(lock, [this] { return m_jobs.empty() && m_jobs_running == 0; });
+}
+
+void PipelineCache::WorkerLoop() {
+	for (;;) {
+		std::function<void()> job;
+		{
+			std::unique_lock lock(m_jobs_mutex);
+			m_jobs_cv.wait(lock, [this] { return m_workers_stop || !m_jobs.empty(); });
+			if (m_jobs.empty()) {
+				return;
+			}
+			job = std::move(m_jobs.front());
+			m_jobs.pop_front();
+			m_jobs_running++;
+		}
+		job();
+		{
+			std::scoped_lock lock(m_jobs_mutex);
+			m_jobs_running--;
+		}
+		m_idle_cv.notify_all();
+	}
+}
+
 void PipelineCache::Save() {
+	WaitWorkersIdle();
+	WriteDriverCache(true);
+}
+
+void PipelineCache::WriteDriverCache(bool destroy) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	m_new_pipelines_since_save = 0;
+	m_last_save                = std::chrono::steady_clock::now();
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -643,8 +728,10 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	if (destroy) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -770,7 +857,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool allow_async) {
 	PerfStats::ScopedTimer lookup_timer(PerfStats::Timer::PipelineLookup);
 	PerfStats::ScopedTimer state_timer(PerfStats::Timer::PipelineState);
 	const auto& vs_input_info  = vertex_info.front();
@@ -938,7 +1025,20 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		auto& found = *iter->second;
+		if (found.pending) {
+			if (!allow_async) {
+				// This draw cannot be skipped: wait for its pipeline to finish compiling.
+				while (!found.pending->done.load(std::memory_order_acquire)) {
+					std::this_thread::sleep_for(std::chrono::microseconds(200));
+				}
+			}
+			if (found.pending->done.load(std::memory_order_acquire)) {
+				found.pipeline = found.pending->pipeline;
+				found.pending.reset();
+			}
+		}
+		return found;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -953,12 +1053,37 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	if (m_async_enabled && allow_async && !m_workers.empty()) {
+		// Layouts and anything reading shader metadata are built here; only the driver compile
+		// (the slow part) runs on a worker. Draws using it are skipped until it is ready.
+		GraphicsPipelineBuild build;
+		PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                        ps_input_info, programs, static_params, build);
+		auto result     = std::make_shared<AsyncPipelineResult>();
+		cached->pending = result;
+		{
+			std::scoped_lock lock(m_jobs_mutex);
+			m_jobs.emplace_back([this, build, result] {
+				result->pipeline = BuildGraphicsPipeline(m_graphics, build, m_driver_cache);
+				result->done.store(true, std::memory_order_release);
+			});
+		}
+		m_jobs_cv.notify_one();
+		PerfStats::Add(PerfStats::Counter::AsyncPipelines);
+	} else {
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+		EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
-
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+
+	// Checkpoint the driver cache now and then while new pipelines appear, so a session that
+	// is killed during a long compile (a level load) keeps what it compiled.
+	if (++m_new_pipelines_since_save >= 64 &&
+	    std::chrono::steady_clock::now() - m_last_save > std::chrono::seconds(60)) {
+		WriteDriverCache(false);
+	}
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
