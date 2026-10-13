@@ -7,12 +7,14 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/metaClearDetector.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -141,6 +143,11 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	// Detects a fast clear of GPU-written color metadata on the GPU (no readback). Returns false
+	// when the image or device cannot use the GPU path, so the caller falls back to the CPU path.
+	[[nodiscard]] bool          TryGpuColorClear(ImageId id, const ImageDesc& desc,
+	                                             uint64_t first_slice_address, uint64_t slice_size,
+	                                             uint32_t image_first, uint32_t count);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -184,6 +191,7 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	std::unique_ptr<MetaClearDetector> m_meta_clear;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

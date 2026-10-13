@@ -1060,6 +1060,140 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+bool TextureCache::TryGpuColorClear(ImageId id, const ImageDesc& desc, uint64_t first_slice_address,
+                                    uint64_t slice_size, uint32_t image_first, uint32_t count) {
+	static const bool enabled = PerfStats::TweakEnabled("gpu_fast_clear", false);
+	if (!enabled || !m_graphics.conditional_rendering_enabled || count == 0 ||
+	    count > MetaClearDetector::MaxSlices || slice_size % 4 != 0) {
+		return false;
+	}
+	const auto& view = desc.view_info;
+	if (view.level_count != 1) {
+		return false;
+	}
+	vk::Extent2D extent {};
+	{
+		std::scoped_lock lock {m_lock};
+		auto& image = m_slot_images[id];
+		if (image.info.IsDepth() || image.info.IsBlock() || image.info.IsVolume() ||
+		    image.info.samples != 1 || image.depth_id || image.info.resources.levels != 1 ||
+		    image_first >= image.backing.layers || count > image.backing.layers - image_first) {
+			return false;
+		}
+		const auto attachment = vk::FormatFeatureFlagBits::eColorAttachment;
+		if (!(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures & attachment) ||
+		    !(m_graphics.GetFormatProperties(image.info.pixel_format).optimalTilingFeatures &
+		      attachment)) {
+			return false;
+		}
+		// Same guest-ownership preparation a partial ClearImage performs. It must happen before the
+		// detection is recorded, because detection consumes the metadata.
+		TrackImage(id);
+		const bool full = image_first == 0 && count == image.backing.layers;
+		if (!full && (image.IsBufferModified() || image.IsCpuDirty())) {
+			InitializeImage(id);
+			if (image.IsBufferModified() || image.IsCpuDirty()) {
+				return false;
+			}
+		}
+		extent = {std::max(image.info.extent.width >> view.base_level, 1u),
+		          std::max(image.info.extent.height >> view.base_level, 1u)};
+	}
+
+	// Candidate codes mirror DecodeColorClear: DCC register clear (0x20) and the four constant
+	// codes; CMask only knows the register clear (code 0).
+	const bool cmask      = desc.info.metadata.kind == ImageMetadataKind::Cmask;
+	const auto candidates = cmask ? 1u : MetaClearDetector::Candidates;
+	std::array<uint8_t, MetaClearDetector::Candidates> codes {
+	    static_cast<uint8_t>(cmask ? 0x00 : 0x20), 0x00, 0x40, 0x80, 0xc0};
+	std::array<vk::ClearColorValue, MetaClearDetector::Candidates> colors {};
+	uint32_t enabled_mask = 0;
+	for (uint32_t k = 0; k < candidates; k++) {
+		if (DecodeColorClear(desc, codes[k], colors[k])) {
+			enabled_mask |= 1u << k;
+		}
+	}
+	PerfStats::Add(PerfStats::Counter::MetaGpuDetections);
+	if (enabled_mask == 0) {
+		// No metadata value could produce a clear for this binding; the CPU path would not
+		// clear or consume anything either.
+		return true;
+	}
+
+	const bool consume = desc.type != BindingType::VideoOut;
+	auto [meta, meta_offset] =
+	    m_buffer_cache.ObtainBuffer(first_slice_address, slice_size * count, consume, false);
+	if (meta == nullptr || meta_offset % 4 != 0) {
+		return false;
+	}
+
+	if (!m_meta_clear) {
+		m_meta_clear = std::make_unique<MetaClearDetector>(m_graphics, m_scheduler);
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	MetaClearDetector::Request request {};
+	request.meta_buffer  = meta->Handle();
+	request.meta_offset  = meta_offset;
+	request.slice_size   = slice_size;
+	request.slice_count  = count;
+	request.codes        = codes;
+	request.enabled_mask = enabled_mask;
+	request.consume      = consume;
+	const auto predicates = m_meta_clear->Record(command.Handle(), request);
+
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	ImageViewInfo    attachment_view {};
+	attachment_view.format      = view.format;
+	attachment_view.type        = count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	attachment_view.base_level  = view.base_level;
+	attachment_view.level_count = 1;
+	attachment_view.base_layer  = image_first;
+	attachment_view.layer_count = count;
+	attachment_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentRead |
+	                  vk::AccessFlagBits2::eColorAttachmentWrite,
+	              {}, command.Handle());
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = image.FindView(attachment_view);
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = extent;
+	rendering.layerCount           = count;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	auto native = command.Handle();
+	native.beginRendering(&rendering);
+	for (uint32_t slice = 0; slice < count; slice++) {
+		for (uint32_t k = 0; k < candidates; k++) {
+			if ((enabled_mask & (1u << k)) == 0) {
+				continue;
+			}
+			vk::ConditionalRenderingBeginInfoEXT condition {};
+			condition.buffer = predicates.buffer;
+			condition.offset = predicates.Offset(slice, k);
+			native.beginConditionalRenderingEXT(&condition);
+			vk::ClearAttachment clear {};
+			clear.aspectMask      = vk::ImageAspectFlagBits::eColor;
+			clear.colorAttachment = 0;
+			clear.clearValue.color = colors[k];
+			vk::ClearRect rect {};
+			rect.rect.extent    = extent;
+			rect.baseArrayLayer = slice;
+			rect.layerCount     = 1;
+			native.clearAttachments(1, &clear, 1, &rect);
+			native.endConditionalRenderingEXT();
+		}
+	}
+	native.endRendering();
+	CommitGpuWrite(image);
+	return true;
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
@@ -1092,9 +1226,15 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	const auto slice_size = range.size / layers;
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		// Prefer detecting the clear on the GPU: no readback, no GPU-thread stall.
+		if (TryGpuColorClear(id, desc, range.address + slice_size * first, slice_size, image_first,
+		                     count)) {
+			return;
+		}
 		// Reading GPU-written metadata back drains the whole GPU queue on the GPU thread. The
 		// optional tweaks skip clear detection for such metadata instead (no clear is applied),
 		// trading possible stale render-target contents for throughput.
@@ -1109,7 +1249,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		PerfStats::Add(PerfStats::Counter::MetaReadbacks);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
