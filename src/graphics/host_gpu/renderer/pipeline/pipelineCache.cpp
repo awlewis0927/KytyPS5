@@ -247,8 +247,11 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			{
+				PerfStats::ScopedTimer srt_timer(PerfStats::Timer::SrtMaterialize);
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    resource_plan, runtime, resources, specialization));
+			}
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -769,6 +772,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
 	PerfStats::ScopedTimer lookup_timer(PerfStats::Timer::PipelineLookup);
+	PerfStats::ScopedTimer state_timer(PerfStats::Timer::PipelineState);
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
