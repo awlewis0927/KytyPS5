@@ -53,6 +53,7 @@ enum class Counter : uint32_t {
 	IndirectDraws, // draws whose arguments were read from guest memory on the CPU
 	AsyncPipelines,    // graphics pipelines queued for background compilation
 	AsyncSkippedDraws, // draws skipped because their pipeline was still compiling
+	RelaxedFaults,     // guest faults on shared GPU/CPU pages served without a stall
 	Count
 };
 

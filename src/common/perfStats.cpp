@@ -253,12 +253,13 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 			std::fprintf(g_file,
 			             "# per-interval totals; times in ms (wall time summed across threads)\n"
 			             "# tweaks: async_readback=%d meta_readback_rt=%d meta_readback_tex=%d "
-			             "gpu_fast_clear=%d async_pipelines=%d\n",
+			             "gpu_fast_clear=%d async_pipelines=%d relax_edge_pages=%d\n",
 			             TweakEnabled("async_readback", true) ? 1 : 0,
 			             TweakEnabled("meta_readback_rt", true) ? 1 : 0,
 			             TweakEnabled("meta_readback_tex", true) ? 1 : 0,
 			             TweakEnabled("gpu_fast_clear", false) ? 1 : 0,
-			             TweakEnabled("async_pipelines", false) ? 1 : 0);
+			             TweakEnabled("async_pipelines", false) ? 1 : 0,
+			             TweakEnabled("relax_edge_pages", false) ? 1 : 0);
 		}
 		g_last_frames = presented_frames;
 	}
@@ -306,6 +307,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	const auto indirect      = Take(Counter::IndirectDraws);
 	const auto async_pipes   = Take(Counter::AsyncPipelines);
 	const auto async_skips   = Take(Counter::AsyncSkippedDraws);
+	const auto relaxed       = Take(Counter::RelaxedFaults);
 
 	if (g_file == nullptr) {
 		return;
@@ -317,7 +319,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             "faults r=%llu w=%llu %llums | async-wait=%llu retries=%llu | draw n=%llu %llums "
 	             "dispatch n=%llu %llums | pipeline=%llu bufsync=%llu texfind=%llu | "
 	             "meta read=%llu skip=%llu gpu=%llu cached=%llu | srt=%llu pipe=%llu bind=%llu rt=%llu "
-	             "commit=%llu | unmap-drain=%llu indirect=%llu | async-pipes=%llu skipped=%llu\n",
+	             "commit=%llu | unmap-drain=%llu indirect=%llu | async-pipes=%llu skipped=%llu | relaxed=%llu\n",
 	             static_cast<double>(g_total_ms) / 1000.0,
 	             static_cast<unsigned long long>(elapsed_ms), fps,
 	             static_cast<unsigned long long>(gpu_busy), static_cast<unsigned long long>(gpu_idle),
@@ -351,7 +353,8 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(unmap_drains),
 	             static_cast<unsigned long long>(indirect),
 	             static_cast<unsigned long long>(async_pipes),
-	             static_cast<unsigned long long>(async_skips));
+	             static_cast<unsigned long long>(async_skips),
+	             static_cast<unsigned long long>(relaxed));
 	WriteHotPages(g_file);
 	WriteWrittenRanges(g_file);
 	std::fflush(g_file);
