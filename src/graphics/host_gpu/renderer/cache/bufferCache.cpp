@@ -287,6 +287,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	PerfStats::Add(PerfStats::Counter::GuestReadbacks);
 	PerfStats::NoteReadbackStack(GuestGpu::IsGpuThread());
+	PerfStats::NoteHotAddress(GuestGpu::IsGpuThread() ? PerfStats::HotKind::GpuReadback
+	                                                  : PerfStats::HotKind::GuestReadback,
+	                          vaddr);
 	PerfStats::ScopedTimer readback_timer(PerfStats::Timer::GuestReadback);
 	auto&      gpu        = m_scheduler.Context().GetGpu();
 	const auto page_begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
