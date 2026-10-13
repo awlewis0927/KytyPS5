@@ -42,6 +42,7 @@ enum class Counter : uint32_t {
 	ReadbackRetries,
 	MetaReadbacks,
 	MetaReadbackSkips,
+	MetaGpuDetections,
 	Count
 };
 
