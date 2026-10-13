@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -12,6 +13,11 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include <bit>
 #include <cstring>
 namespace Libs::Graphics {
@@ -58,6 +64,87 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	if (m_graphics.checkpoints_enabled && m_buffer != nullptr) {
+		RecordGpuCheckpoint(m_graphics, m_buffer, op, submit_id, arg0, arg1, arg2, arg3, arg4);
+	}
+}
+
+namespace {
+struct CheckpointRecord {
+	uint64_t seq       = 0;
+	uint64_t submit_id = 0;
+	uint64_t arg4      = 0;
+	uint32_t op        = 0;
+	uint32_t arg0      = 0;
+	uint32_t arg1      = 0;
+	uint32_t arg2      = 0;
+	uint32_t arg3      = 0;
+};
+constexpr uint64_t                             CheckpointRing = 8192;
+std::array<CheckpointRecord, CheckpointRing>   g_checkpoints {};
+std::atomic<uint64_t>                          g_checkpoint_seq {0};
+std::atomic_bool                               g_checkpoints_dumped {false};
+} // namespace
+
+void RecordGpuCheckpoint(GraphicContext& /*graphics*/, vk::CommandBuffer buffer, uint32_t op,
+                         uint64_t submit_id, uint32_t arg0, uint32_t arg1, uint32_t arg2,
+                         uint32_t arg3, uint64_t arg4) {
+	const auto seq = g_checkpoint_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&      rec = g_checkpoints[seq % CheckpointRing];
+	rec            = {seq, submit_id, arg4, op, arg0, arg1, arg2, arg3};
+	// The marker is an opaque pointer-sized value; the sequence number identifies the record.
+	buffer.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(seq)));
+}
+
+void DumpGpuCheckpoints(GraphicContext& graphics, const char* reason) {
+	if (g_checkpoints_dumped.exchange(true)) {
+		return;
+	}
+	std::string text = std::string("GPU failure: ") + reason + "\n";
+	if (!graphics.checkpoints_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV == nullptr) {
+		text += "checkpoints unavailable\n";
+		PerfStats::WriteCrashReport(text.c_str(), nullptr);
+		return;
+	}
+	uint32_t count = 0;
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(graphics.queue, &count, nullptr);
+	std::vector<VkCheckpointDataNV> data(count);
+	for (auto& item: data) {
+		item       = {};
+		item.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(graphics.queue, &count, data.data());
+	const auto last = g_checkpoint_seq.load();
+	char       line[256];
+	std::snprintf(line, sizeof(line), "last recorded seq=%llu; GPU-reached markers=%u\n",
+	              static_cast<unsigned long long>(last), count);
+	text += line;
+	uint64_t lowest = UINT64_MAX;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto seq = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+		lowest         = std::min(lowest, seq);
+		std::snprintf(line, sizeof(line), "  stage=0x%08x seq=%llu\n",
+		              static_cast<unsigned>(data[i].stage), static_cast<unsigned long long>(seq));
+		text += line;
+	}
+	// Dump the CPU-side records from a little before the oldest reached marker to the newest.
+	const uint64_t from = (count == 0 || lowest > last) ? (last > 64 ? last - 64 : 1)
+	                                                    : (lowest > 16 ? lowest - 16 : 1);
+	const uint64_t to   = std::min(last, from + 200);
+	text += "records (seq op submit arg0 arg1 arg2 arg3 arg4):\n";
+	for (uint64_t seq = from; seq <= to; seq++) {
+		const auto& rec = g_checkpoints[seq % CheckpointRing];
+		if (rec.seq != seq) {
+			continue;
+		}
+		std::snprintf(line, sizeof(line), "  %llu op=%u sub=%llu %x %u %u %u %llx\n",
+		              static_cast<unsigned long long>(rec.seq), rec.op,
+		              static_cast<unsigned long long>(rec.submit_id), rec.arg0, rec.arg1, rec.arg2,
+		              rec.arg3, static_cast<unsigned long long>(rec.arg4));
+		text += line;
+	}
+	PerfStats::WriteCrashReport(text.c_str(), nullptr);
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
