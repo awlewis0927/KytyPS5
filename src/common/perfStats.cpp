@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -239,12 +240,216 @@ void Add(Counter counter, uint64_t value) noexcept {
 	g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
 }
 
+namespace {
+
+#if defined(_WIN32)
+uintptr_t ImageBase() noexcept {
+	static const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	return base;
+}
+uintptr_t ImageEnd() noexcept {
+	static const auto end = [] {
+		const auto  base = ImageBase();
+		const auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt   = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+            base + static_cast<uintptr_t>(dos->e_lfanew));
+		return base + nt->OptionalHeader.SizeOfImage;
+	}();
+	return end;
+}
+bool InImage(uint64_t pc) noexcept { return pc >= ImageBase() && pc < ImageEnd(); }
+
+// Walks a captured context with the x64 unwind tables. Frames without unwind data (JIT or guest
+// code) end the walk, except a leaf at the top whose return address is read from RSP.
+uint32_t UnwindContext(CONTEXT ctx, uint64_t* frames, uint32_t max_frames) noexcept {
+	uint32_t n = 0;
+	while (n < max_frames) {
+		const uint64_t pc = ctx.Rip;
+		if (pc == 0) {
+			break;
+		}
+		frames[n++]       = pc;
+		DWORD64 base      = 0;
+		auto*   function  = RtlLookupFunctionEntry(pc, &base, nullptr);
+		if (function == nullptr) {
+			if (n == 1 && InImage(pc)) {
+				ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+				ctx.Rsp += 8;
+				continue;
+			}
+			break;
+		}
+		void*   handler_data = nullptr;
+		DWORD64 establisher  = 0;
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, pc, function, &ctx, &handler_data, &establisher,
+		                 nullptr);
+	}
+	return n;
+}
+
+std::string FramesToText(const uint64_t* frames, uint32_t count, uint32_t max_kept) {
+	std::string text;
+	uint32_t    kept     = 0;
+	bool        external = false;
+	for (uint32_t i = 0; i < count && kept < max_kept; i++) {
+		char item[24];
+		if (InImage(frames[i])) {
+			std::snprintf(item, sizeof(item), " %llx",
+			              static_cast<unsigned long long>(frames[i] - ImageBase()));
+			text += item;
+			kept++;
+			external = false;
+		} else if (!external) {
+			text += " x";
+			external = true;
+		}
+	}
+	return text;
+}
+
+std::mutex                                g_sampler_mutex;
+std::unordered_map<std::string, uint64_t> g_sampler_total;
+std::unordered_map<std::string, uint64_t> g_sampler_window;
+uint64_t                                  g_sampler_samples = 0;
+std::atomic_bool                          g_sampler_started {false};
+
+void SamplerLoop(HANDLE thread) noexcept {
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	std::vector<std::pair<std::array<uint64_t, 32>, uint32_t>> batch;
+	batch.reserve(256);
+	for (;;) {
+		Sleep(1);
+		if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+			return;
+		}
+		CONTEXT ctx {};
+		ctx.ContextFlags = CONTEXT_FULL;
+		std::array<uint64_t, 32> frames {};
+		uint32_t                 count = 0;
+		if (GetThreadContext(thread, &ctx) != 0) {
+			count = UnwindContext(ctx, frames.data(), static_cast<uint32_t>(frames.size()));
+		}
+		ResumeThread(thread);
+		if (count == 0) {
+			continue;
+		}
+		batch.emplace_back(frames, count);
+		if (batch.size() >= 64) {
+			std::lock_guard lock(g_sampler_mutex);
+			for (const auto& [f, c]: batch) {
+				auto key = FramesToText(f.data(), c, 20);
+				g_sampler_total[key]++;
+				g_sampler_window[key]++;
+				g_sampler_samples++;
+			}
+			batch.clear();
+		}
+	}
+}
+
+void WriteTop(FILE* file, const std::unordered_map<std::string, uint64_t>& map, size_t limit) {
+	std::vector<std::pair<std::string, uint64_t>> stacks(map.begin(), map.end());
+	std::sort(stacks.begin(), stacks.end(),
+	          [](const auto& a, const auto& b) { return a.second > b.second; });
+	for (size_t i = 0; i < stacks.size() && i < limit; i++) {
+		std::fprintf(file, "%8llu |%s\n", static_cast<unsigned long long>(stacks[i].second),
+		             stacks[i].first.c_str());
+	}
+}
+#endif
+
+void DumpSamplerProfile() noexcept {
+#if defined(_WIN32)
+	if (!g_sampler_started.load()) {
+		return;
+	}
+	std::unordered_map<std::string, uint64_t> total;
+	std::unordered_map<std::string, uint64_t> window;
+	uint64_t                                  samples = 0;
+	{
+		std::lock_guard lock(g_sampler_mutex);
+		total   = g_sampler_total;
+		window.swap(g_sampler_window);
+		samples = g_sampler_samples;
+	}
+	FILE* file = std::fopen("_gpu_profile.log", "w");
+	if (file == nullptr) {
+		return;
+	}
+	std::fprintf(file,
+	             "# GPU command thread stack samples (~1 kHz). RVAs inside kyty_emulator.exe, "
+	             "innermost first; x = frames outside the exe\n# samples=%llu t=%llus\n"
+	             "## last 5 seconds\n",
+	             static_cast<unsigned long long>(samples),
+	             static_cast<unsigned long long>(g_total_ms / 1000));
+	WriteTop(file, window, 40);
+	std::fprintf(file, "## since start\n");
+	WriteTop(file, total, 2000);
+	std::fclose(file);
+#endif
+}
+
+} // namespace
+
+void StartThreadSampler() noexcept {
+#if defined(_WIN32)
+	if (!TweakEnabled("gpu_profiler", true) || g_sampler_started.exchange(true)) {
+		return;
+	}
+	HANDLE thread = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread,
+	                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+	                    FALSE, 0) == 0) {
+		return;
+	}
+	std::thread(SamplerLoop, thread).detach();
+#endif
+}
+
+void WriteCrashReport(const char* text, void* native_context) noexcept {
+	static std::atomic_uint32_t reports {0};
+	if (reports.fetch_add(1) >= 16) {
+		return;
+	}
+	FILE* file = std::fopen("_crash.log", "a");
+	if (file == nullptr) {
+		return;
+	}
+	std::fprintf(file, "=== t=%llus thread=%lu\n%s\n", static_cast<unsigned long long>(g_total_ms / 1000),
+#if defined(_WIN32)
+	             static_cast<unsigned long>(GetCurrentThreadId()),
+#else
+	             0ul,
+#endif
+	             text);
+#if defined(_WIN32)
+	uint64_t frames[48];
+	uint32_t count = 0;
+	if (native_context != nullptr) {
+		count = UnwindContext(*static_cast<CONTEXT*>(native_context), frames, 48);
+	} else {
+		void* raw[48];
+		count = RtlCaptureStackBackTrace(0, 48, raw, nullptr);
+		for (uint32_t i = 0; i < count; i++) {
+			frames[i] = reinterpret_cast<uint64_t>(raw[i]);
+		}
+	}
+	std::fprintf(file, "stack:%s\n", FramesToText(frames, count, 40).c_str());
+#else
+	(void)native_context;
+#endif
+	std::fclose(file);
+}
+
 void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	if (elapsed_ms == 0) {
 		return;
 	}
 	if (++g_report_count % 10 == 0) {
 		DumpReadbackStacks();
+	}
+	if (g_report_count % 5 == 0) {
+		DumpSamplerProfile();
 	}
 	if (!g_header_known) {
 		g_header_known = true;

@@ -1,4 +1,5 @@
 #include "common/hostException.h"
+#include "common/perfStats.h"
 
 #include <atomic>
 #include <cstdio>
@@ -135,6 +136,18 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	{
+		const auto base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+		char       text[256];
+		std::snprintf(text, sizeof(text),
+		              "unhandled host exception code=%08lx pc=%llx (rva %llx) vaddr=%llx access=%d",
+		              static_cast<unsigned long>(exception_record->ExceptionCode),
+		              static_cast<unsigned long long>(info.exception_address),
+		              static_cast<unsigned long long>(info.exception_address - base),
+		              static_cast<unsigned long long>(info.access_violation_vaddr),
+		              static_cast<int>(info.access_violation_type));
+		PerfStats::WriteCrashReport(text, exception->ContextRecord);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }

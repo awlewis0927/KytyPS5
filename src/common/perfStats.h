@@ -75,6 +75,13 @@ void NoteHotAddress(HotKind kind, uint64_t address) noexcept;
 // Large GPU-written buffer bindings (they mark the whole range GPU-owned), keyed by base address.
 void NoteWrittenRange(uint64_t address, uint64_t size) noexcept;
 
+// Starts a ~1 kHz stack sampler for the calling thread (the GPU command thread); stacks are
+// written to _gpu_profile.log every few seconds. Windows only; "gpu_profiler=0" disables it.
+void StartThreadSampler() noexcept;
+// Appends a fatal error/unhandled fault with a stack (from the context, or the current stack) to
+// _crash.log. Windows stacks only.
+void WriteCrashReport(const char* text, void* native_context) noexcept;
+
 // Called by the window thread about once per second with the presented frame total.
 void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept;
 
