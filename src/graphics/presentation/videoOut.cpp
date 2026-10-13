@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "common/perfStats.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -1166,6 +1167,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 }
 
 void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
+	PerfStats::ScopedTimer slot_timer(PerfStats::Timer::FlipSlotWait);
 	Common::LockGuard lock(m_mutex);
 	auto belongs_to_port = [&cfg](const auto& request) { return request.cfg == &cfg; };
 	while (std::count_if(m_requests.begin(), m_requests.end(), belongs_to_port) +
