@@ -3,6 +3,10 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 
 namespace PerfStats {
 
@@ -27,7 +31,46 @@ uint64_t Take(Counter counter) noexcept {
 	return g_counters[static_cast<size_t>(counter)].exchange(0, std::memory_order_relaxed);
 }
 
+std::map<std::string, bool>& Tweaks() {
+	static std::map<std::string, bool> tweaks = [] {
+		std::map<std::string, bool> result;
+		if (FILE* file = std::fopen("_kyty_tweaks.ini", "r"); file != nullptr) {
+			char line[256];
+			while (std::fgets(line, sizeof(line), file) != nullptr) {
+				std::string text(line);
+				if (const auto hash = text.find('#'); hash != std::string::npos) {
+					text.resize(hash);
+				}
+				const auto eq = text.find('=');
+				if (eq == std::string::npos) {
+					continue;
+				}
+				auto trim = [](std::string value) {
+					const auto first = value.find_first_not_of(" \t\r\n");
+					const auto last  = value.find_last_not_of(" \t\r\n");
+					return first == std::string::npos ? std::string {}
+					                                  : value.substr(first, last - first + 1);
+				};
+				const auto key   = trim(text.substr(0, eq));
+				const auto value = trim(text.substr(eq + 1));
+				if (!key.empty()) {
+					result[key] = !(value == "0" || value == "false" || value == "off");
+				}
+			}
+			std::fclose(file);
+		}
+		return result;
+	}();
+	return tweaks;
+}
+
 } // namespace
+
+bool TweakEnabled(const char* key, bool default_value) noexcept {
+	const auto& tweaks = Tweaks();
+	const auto  it     = tweaks.find(key);
+	return it == tweaks.end() ? default_value : it->second;
+}
 
 void AddTime(Timer timer, uint64_t nanoseconds) noexcept {
 	g_timers[static_cast<size_t>(timer)].fetch_add(nanoseconds, std::memory_order_relaxed);
@@ -46,7 +89,9 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 		g_file         = std::fopen("_perf.log", "w");
 		if (g_file != nullptr) {
 			std::fprintf(g_file,
-			             "# per-interval totals; times in ms (wall time summed across threads)\n");
+			             "# per-interval totals; times in ms (wall time summed across threads)\n"
+			             "# tweaks: async_readback=%d\n",
+			             TweakEnabled("async_readback", true) ? 1 : 0);
 		}
 		g_last_frames = presented_frames;
 	}
@@ -71,6 +116,16 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	const auto write_faults  = Take(Counter::WriteFaults);
 	const auto shaders       = Take(Counter::ShaderCompiles);
 	const auto submissions   = Take(Counter::Submissions);
+	const auto async_wait    = TakeMs(Timer::AsyncReadbackWait);
+	const auto draw          = TakeMs(Timer::Draw);
+	const auto dispatch      = TakeMs(Timer::Dispatch);
+	const auto pipeline      = TakeMs(Timer::PipelineLookup);
+	const auto buffer_sync   = TakeMs(Timer::BufferSync);
+	const auto texture_find  = TakeMs(Timer::TextureFind);
+	const auto fault_time    = TakeMs(Timer::FaultHandling);
+	const auto draws         = Take(Counter::Draws);
+	const auto dispatches    = Take(Counter::Dispatches);
+	const auto retries       = Take(Counter::ReadbackRetries);
 
 	if (g_file == nullptr) {
 		return;
@@ -79,7 +134,8 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             "t=%6.1fs int=%4llums fps=%5.1f | gpu-thread busy=%4llu idle=%4llu subs=%llu | "
 	             "readback n=%llu guest-blocked=%llu gpu-wait=%llu | finish=%llu sched-wait=%llu "
 	             "stream=%llu faultbuf=%llu | flip-slot=%llu | shaders n=%llu %llums | "
-	             "faults r=%llu w=%llu\n",
+	             "faults r=%llu w=%llu %llums | async-wait=%llu retries=%llu | draw n=%llu %llums "
+	             "dispatch n=%llu %llums | pipeline=%llu bufsync=%llu texfind=%llu\n",
 	             static_cast<double>(g_total_ms) / 1000.0,
 	             static_cast<unsigned long long>(elapsed_ms), fps,
 	             static_cast<unsigned long long>(gpu_busy), static_cast<unsigned long long>(gpu_idle),
@@ -94,7 +150,15 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(flip_slot),
 	             static_cast<unsigned long long>(shaders), static_cast<unsigned long long>(shader),
 	             static_cast<unsigned long long>(read_faults),
-	             static_cast<unsigned long long>(write_faults));
+	             static_cast<unsigned long long>(write_faults),
+	             static_cast<unsigned long long>(fault_time),
+	             static_cast<unsigned long long>(async_wait), static_cast<unsigned long long>(retries),
+	             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(draw),
+	             static_cast<unsigned long long>(dispatches),
+	             static_cast<unsigned long long>(dispatch),
+	             static_cast<unsigned long long>(pipeline),
+	             static_cast<unsigned long long>(buffer_sync),
+	             static_cast<unsigned long long>(texture_find));
 	std::fflush(g_file);
 }
 

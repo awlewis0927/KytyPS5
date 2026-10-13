@@ -21,6 +21,13 @@ enum class Timer : uint32_t {
 	GpuThreadIdle,   // GPU command thread with no submissions to process
 	GpuThreadBusy,   // GPU command thread processing guest submissions
 	ShaderCompile,   // shader recompile + Vulkan pipeline creation on a cache miss
+	AsyncReadbackWait, // guest thread waiting for an asynchronous readback to publish
+	Draw,            // GPU thread inside DrawIndex/DrawAuto
+	Dispatch,        // GPU thread inside DispatchDirect/DispatchIndirect
+	PipelineLookup,  // program + pipeline lookup (includes compiles on a miss)
+	BufferSync,      // buffer cache CPU->GPU synchronization (uploads)
+	TextureFind,     // texture cache image lookup/creation
+	FaultHandling,   // guest-memory page fault handling (all threads)
 	Count
 };
 
@@ -30,11 +37,18 @@ enum class Counter : uint32_t {
 	WriteFaults,
 	ShaderCompiles,
 	Submissions,
+	Draws,
+	Dispatches,
+	ReadbackRetries,
 	Count
 };
 
 void AddTime(Timer timer, uint64_t nanoseconds) noexcept;
 void Add(Counter counter, uint64_t value = 1) noexcept;
+
+// Reads a boolean from _kyty_tweaks.ini next to the emulator ("key=0" / "key=1"); the file is
+// parsed once, and missing keys return default_value.
+bool TweakEnabled(const char* key, bool default_value) noexcept;
 
 // Called by the window thread about once per second with the presented frame total.
 void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept;
