@@ -1,0 +1,81 @@
+#version 450
+
+// Detects guest color fast clears (DCC/CMask) on the GPU.
+//
+// One workgroup scans one metadata slice. When every byte of the slice holds the same code and
+// that code is one of the candidates the CPU could decode into a clear color, the workgroup sets
+// the matching predicate word so a conditional-rendering clear fires, and (optionally) rewrites
+// the slice to 0xff, i.e. "uncompressed", exactly like the CPU path does after applying a clear.
+// This replaces a synchronous GPU->CPU readback of the metadata on the emulator's GPU thread.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer MetaBuffer {
+    uint meta[];
+};
+
+layout(std430, binding = 1) buffer PredicateBuffer {
+    uint predicates[];
+};
+
+layout(push_constant) uniform Params {
+    uint meta_offset_words; // dword index of the first scanned slice inside meta[]
+    uint slice_words;       // dwords per metadata slice
+    uint predicate_offset;  // dword index of the first slice's predicate slot
+    uint codes_0_3;         // candidate codes 0..3, one per byte
+    uint code_4;            // candidate code 4 in the low byte
+    uint enabled_mask;      // bit k set when the CPU recorded a clear for candidate k
+    uint consume;           // non-zero: mark applied slices uncompressed (0xff)
+} params;
+
+const uint kCandidates   = 5u;
+const uint kSlotStride   = 8u; // predicate dwords reserved per slice
+
+shared uint s_mismatch;
+
+void main() {
+    const uint slice = gl_WorkGroupID.x;
+    const uint lane  = gl_LocalInvocationIndex;
+    const uint base  = params.meta_offset_words + slice * params.slice_words;
+
+    if (lane == 0u) {
+        s_mismatch = 0u;
+    }
+    barrier();
+
+    const uint first_code = meta[base] & 0xffu;
+    const uint expected   = first_code * 0x01010101u;
+    for (uint i = lane; i < params.slice_words; i += gl_WorkGroupSize.x) {
+        if (meta[base + i] != expected) {
+            atomicOr(s_mismatch, 1u);
+            break;
+        }
+    }
+    barrier();
+
+    uint hit = kCandidates;
+    if (s_mismatch == 0u) {
+        for (uint k = 0u; k < kCandidates; ++k) {
+            const uint code =
+                k < 4u ? ((params.codes_0_3 >> (8u * k)) & 0xffu) : (params.code_4 & 0xffu);
+            if (((params.enabled_mask >> k) & 1u) != 0u && code == first_code) {
+                hit = k;
+                break;
+            }
+        }
+    }
+
+    if (lane == 0u) {
+        const uint slot = params.predicate_offset + slice * kSlotStride;
+        for (uint k = 0u; k < kCandidates; ++k) {
+            predicates[slot + k] = (k == hit) ? 1u : 0u;
+        }
+    }
+
+    // Every lane finished reading the slice before the second barrier, so it can be rewritten.
+    if (hit < kCandidates && params.consume != 0u) {
+        for (uint i = lane; i < params.slice_words; i += gl_WorkGroupSize.x) {
+            meta[base + i] = 0xffffffffu;
+        }
+    }
+}
