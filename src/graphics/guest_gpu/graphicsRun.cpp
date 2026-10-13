@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/perfStats.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -478,7 +479,10 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						PerfStats::ScopedTimer idle_timer(PerfStats::Timer::GpuThreadIdle);
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -515,7 +519,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		PerfStats::Add(PerfStats::Counter::Submissions);
+		const bool complete = [&] {
+			PerfStats::ScopedTimer busy_timer(PerfStats::Timer::GpuThreadBusy);
+			return gpu->Process(submission);
+		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
