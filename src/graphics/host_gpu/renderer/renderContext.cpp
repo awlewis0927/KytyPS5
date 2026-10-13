@@ -64,6 +64,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	PerfStats::Add(access == PageFaultAccess::Write ? PerfStats::Counter::WriteFaults
 	                                                : PerfStats::Counter::ReadFaults);
+	PerfStats::ScopedTimer fault_timer(PerfStats::Timer::FaultHandling);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
