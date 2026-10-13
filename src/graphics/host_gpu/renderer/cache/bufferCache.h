@@ -131,6 +131,9 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// Ranges whose asynchronous readback is recorded but not yet published (GPU thread only).
+	RangeSet                                          m_inflight_readbacks;
+	bool                                              m_async_readback = true;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

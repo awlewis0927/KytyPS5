@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -233,6 +234,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	m_async_readback = PerfStats::TweakEnabled("async_readback", true);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -285,19 +287,94 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	PerfStats::Add(PerfStats::Counter::GuestReadbacks);
 	PerfStats::ScopedTimer readback_timer(PerfStats::Timer::GuestReadback);
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
+	auto&      gpu        = m_scheduler.Context().GetGpu();
+	const auto page_begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto page_size  = ((vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1)) -
+	                       page_begin;
+	if (!m_async_readback || GuestGpu::IsGpuThread()) {
+		gpu.SendCommandSync([this, vaddr, size, is_write, page_begin, page_size] {
+			if (m_inflight_readbacks.Intersects(page_begin, page_size)) {
+				// The GPU thread touched pages whose asynchronous readback is still publishing.
+				// Finish it here; the owning guest thread's completion step becomes a no-op.
+				m_scheduler.WaitPriorityOperations(m_scheduler.CurrentTick() - 1);
+				m_inflight_readbacks.Subtract(page_begin, page_size);
+				if (!m_gpu_modified_ranges.Intersects(page_begin, page_size)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+					if (is_write) {
+						m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+					}
+					return;
+				}
+			}
+			if (is_write && !IsRegionRegistered(vaddr, size)) {
+				return;
+			}
+			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+			if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			}
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+		});
+		return;
+	}
+
+	// Asynchronous readback: the GPU thread records the copy and submits it, then keeps
+	// processing guest work while this (faulting) guest thread waits for the copy to publish.
+	// Pages stay protected until the data is written back, so no thread can observe or
+	// overwrite stale contents; a range written again by the GPU meanwhile stays protected
+	// and is read back again on the next fault.
+	enum class Step { Done, Wait, Busy };
+	for (;;) {
+		Step     step = Step::Done;
+		uint64_t tick = 0;
+		gpu.SendCommandSync([&] {
+			if (m_inflight_readbacks.Intersects(page_begin, page_size)) {
+				step = Step::Busy;
+				return;
+			}
+			if (is_write && !IsRegionRegistered(vaddr, size)) {
+				return;
+			}
+			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+			if (!DownloadBufferMemory<true>(buffer, vaddr, size)) {
+				if (is_write) {
+					m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				}
+				return;
+			}
+			m_inflight_readbacks.Add(page_begin, page_size);
+			tick = m_scheduler.CurrentTick();
+			m_scheduler.Flush();
+			step = Step::Wait;
+		});
+		if (step == Step::Busy) {
+			// Another guest thread is reading these pages back; let it publish and retry.
+			PerfStats::Add(PerfStats::Counter::ReadbackRetries);
+			std::this_thread::yield();
+			continue;
+		}
+		if (step == Step::Done) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		{
+			PerfStats::ScopedTimer wait_timer(PerfStats::Timer::AsyncReadbackWait);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
+		gpu.SendCommandSync([&] {
+			m_inflight_readbacks.Subtract(page_begin, page_size);
+			if (m_gpu_modified_ranges.Intersects(page_begin, page_size)) {
+				return;
+			}
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		}
-	});
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+		});
+		return;
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -405,6 +482,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	PerfStats::ScopedTimer sync_timer(PerfStats::Timer::BufferSync);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -623,6 +701,10 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	if (!m_inflight_readbacks.Empty()) {
+		// An in-flight readback owns GPU-dirty pages whose ranges are already detached.
+		return;
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
