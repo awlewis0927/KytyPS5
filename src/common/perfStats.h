@@ -28,6 +28,11 @@ enum class Timer : uint32_t {
 	BufferSync,      // buffer cache CPU->GPU synchronization (uploads)
 	TextureFind,     // texture cache image lookup/creation
 	FaultHandling,   // guest-memory page fault handling (all threads)
+	SrtMaterialize,  // per-draw shader resource table evaluation (part of PipelineLookup)
+	PipelineState,   // graphics pipeline key build + lookup (part of PipelineLookup)
+	Bindings,        // per-draw descriptor/texture/buffer binding preparation
+	RenderTargets,   // per-draw color/depth target resolution and acquisition
+	Commit,          // per-draw command recording (descriptors, dynamic state, draw call)
 	Count
 };
 
@@ -43,6 +48,8 @@ enum class Counter : uint32_t {
 	MetaReadbacks,
 	MetaReadbackSkips,
 	MetaGpuDetections,
+	UnmapDrains,   // guest unmaps that forced a full GPU drain
+	IndirectDraws, // draws whose arguments were read from guest memory on the CPU
 	Count
 };
 

@@ -205,6 +205,13 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	const auto meta_reads    = Take(Counter::MetaReadbacks);
 	const auto meta_skips    = Take(Counter::MetaReadbackSkips);
 	const auto meta_gpu      = Take(Counter::MetaGpuDetections);
+	const auto srt           = TakeMs(Timer::SrtMaterialize);
+	const auto pipe_state    = TakeMs(Timer::PipelineState);
+	const auto bindings      = TakeMs(Timer::Bindings);
+	const auto targets       = TakeMs(Timer::RenderTargets);
+	const auto commit        = TakeMs(Timer::Commit);
+	const auto unmap_drains  = Take(Counter::UnmapDrains);
+	const auto indirect      = Take(Counter::IndirectDraws);
 
 	if (g_file == nullptr) {
 		return;
@@ -215,7 +222,8 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             "stream=%llu faultbuf=%llu | flip-slot=%llu | shaders n=%llu %llums | "
 	             "faults r=%llu w=%llu %llums | async-wait=%llu retries=%llu | draw n=%llu %llums "
 	             "dispatch n=%llu %llums | pipeline=%llu bufsync=%llu texfind=%llu | "
-	             "meta read=%llu skip=%llu gpu=%llu\n",
+	             "meta read=%llu skip=%llu gpu=%llu | srt=%llu pipe=%llu bind=%llu rt=%llu "
+	             "commit=%llu | unmap-drain=%llu indirect=%llu\n",
 	             static_cast<double>(g_total_ms) / 1000.0,
 	             static_cast<unsigned long long>(elapsed_ms), fps,
 	             static_cast<unsigned long long>(gpu_busy), static_cast<unsigned long long>(gpu_idle),
@@ -241,7 +249,12 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(texture_find),
 	             static_cast<unsigned long long>(meta_reads),
 	             static_cast<unsigned long long>(meta_skips),
-	             static_cast<unsigned long long>(meta_gpu));
+	             static_cast<unsigned long long>(meta_gpu), static_cast<unsigned long long>(srt),
+	             static_cast<unsigned long long>(pipe_state),
+	             static_cast<unsigned long long>(bindings), static_cast<unsigned long long>(targets),
+	             static_cast<unsigned long long>(commit),
+	             static_cast<unsigned long long>(unmap_drains),
+	             static_cast<unsigned long long>(indirect));
 	std::fflush(g_file);
 }
 
