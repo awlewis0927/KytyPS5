@@ -1163,10 +1163,31 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// A draw may be skipped while its pipeline compiles in the background only when it writes
+	// nothing but its attachments: skipping a shader buffer or storage image write could break
+	// later GPU work, while a missing draw only leaves one frame incomplete.
+	const auto stage_writes_memory = [](const ShaderStageRuntime& runtime) {
+		if (HasShaderBufferWrites(runtime)) {
+			return true;
+		}
+		return std::ranges::any_of(runtime.program->info.images,
+		                           [](const auto& image) { return image.written; });
+	};
+	bool allow_async = true;
+	for (const auto& stage: vertex_stages) {
+		allow_async = allow_async && !stage_writes_memory(stage.stage);
+	}
+	if (state.ps_active) {
+		allow_async = allow_async && !stage_writes_memory(state.ps_input_info.stage);
+	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, allow_async);
+	if (pipeline.pipeline == nullptr) {
+		PerfStats::Add(PerfStats::Counter::AsyncSkippedDraws);
+		return;
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	std::optional<PerfStats::ScopedTimer> targets_timer(std::in_place,
 	                                                    PerfStats::Timer::RenderTargets);
