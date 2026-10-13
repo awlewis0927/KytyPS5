@@ -35,6 +35,7 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               depth_color_copy_enabled               = false;
 	bool                               conditional_rendering_enabled          = false;
+	bool                               checkpoints_enabled                    = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -141,6 +142,13 @@ struct VulkanImage {
 };
 
 
+
+// GPU hang diagnostics (VK_NV_device_diagnostic_checkpoints): every recorded draw/dispatch leaves
+// a marker; after a device loss the last markers the GPU reached are written to _crash.log.
+void RecordGpuCheckpoint(GraphicContext& graphics, vk::CommandBuffer buffer, uint32_t op,
+                         uint64_t submit_id, uint32_t arg0, uint32_t arg1, uint32_t arg2,
+                         uint32_t arg3, uint64_t arg4);
+void DumpGpuCheckpoints(GraphicContext& graphics, const char* reason);
 
 } // namespace Libs::Graphics
 
