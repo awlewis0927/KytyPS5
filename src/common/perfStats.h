@@ -50,6 +50,10 @@ void Add(Counter counter, uint64_t value = 1) noexcept;
 // parsed once, and missing keys return default_value.
 bool TweakEnabled(const char* key, bool default_value) noexcept;
 
+// Records the calling stack (frames inside the emulator image) for a buffer readback, so the
+// emulator code that triggers readbacks can be identified. Windows only; no-op elsewhere.
+void NoteReadbackStack(bool gpu_thread) noexcept;
+
 // Called by the window thread about once per second with the presented frame total.
 void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept;
 

@@ -4,9 +4,20 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace PerfStats {
 
@@ -64,7 +75,65 @@ std::map<std::string, bool>& Tweaks() {
 	return tweaks;
 }
 
+std::mutex                                g_stack_mutex;
+std::unordered_map<std::string, uint64_t> g_stacks;
+uint64_t                                  g_report_count = 0;
+
+void DumpReadbackStacks() noexcept {
+	std::vector<std::pair<std::string, uint64_t>> stacks;
+	{
+		std::lock_guard lock(g_stack_mutex);
+		stacks.assign(g_stacks.begin(), g_stacks.end());
+	}
+	if (stacks.empty()) {
+		return;
+	}
+	std::sort(stacks.begin(), stacks.end(),
+	          [](const auto& a, const auto& b) { return a.second > b.second; });
+	FILE* file = std::fopen("_readback_stacks.log", "w");
+	if (file == nullptr) {
+		return;
+	}
+	std::fprintf(file, "# readback call stacks since start (G = GPU thread, C = guest thread)\n"
+	                   "# count | frames as RVAs inside kyty_emulator.exe, innermost first\n");
+	for (size_t i = 0; i < stacks.size() && i < 40; i++) {
+		std::fprintf(file, "%10llu | %s\n", static_cast<unsigned long long>(stacks[i].second),
+		             stacks[i].first.c_str());
+	}
+	std::fclose(file);
+}
+
 } // namespace
+
+void NoteReadbackStack(bool gpu_thread) noexcept {
+#if defined(_WIN32)
+	static const auto image_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	static const auto image_end  = [] {
+		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base);
+		const auto* nt =
+		    reinterpret_cast<const IMAGE_NT_HEADERS*>(image_base + static_cast<uintptr_t>(dos->e_lfanew));
+		return image_base + nt->OptionalHeader.SizeOfImage;
+	}();
+	void*      frames[48];
+	const auto count = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+	std::string key  = gpu_thread ? "G" : "C";
+	int         kept = 0;
+	for (USHORT i = 0; i < count && kept < 16; i++) {
+		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+		if (address >= image_base && address < image_end) {
+			char text[24];
+			std::snprintf(text, sizeof(text), " %llx",
+			              static_cast<unsigned long long>(address - image_base));
+			key += text;
+			kept++;
+		}
+	}
+	std::lock_guard lock(g_stack_mutex);
+	g_stacks[key]++;
+#else
+	(void)gpu_thread;
+#endif
+}
 
 bool TweakEnabled(const char* key, bool default_value) noexcept {
 	const auto& tweaks = Tweaks();
@@ -83,6 +152,9 @@ void Add(Counter counter, uint64_t value) noexcept {
 void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	if (elapsed_ms == 0) {
 		return;
+	}
+	if (++g_report_count % 10 == 0) {
+		DumpReadbackStacks();
 	}
 	if (!g_header_known) {
 		g_header_known = true;
