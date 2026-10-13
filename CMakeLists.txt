@@ -810,6 +810,10 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+if(KYTY_CLANG_CL)
+	# Ship the linker map so host addresses in diagnostics can be symbolized.
+	install(FILES "${KYTY_EMULATOR_MAP_LINK_PATH}" DESTINATION . OPTIONAL)
+endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 
