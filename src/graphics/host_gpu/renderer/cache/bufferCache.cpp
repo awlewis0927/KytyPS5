@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/perfStats.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -210,8 +211,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+		{
+			PerfStats::ScopedTimer download_timer(PerfStats::Timer::DownloadWait);
+			m_scheduler.Wait(tick);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
 		publish();
 	}
 	return true;
@@ -279,6 +283,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	PerfStats::Add(PerfStats::Counter::GuestReadbacks);
+	PerfStats::ScopedTimer readback_timer(PerfStats::Timer::GuestReadback);
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;

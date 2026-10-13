@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "common/perfStats.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -322,7 +323,10 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
+		{
+			PerfStats::ScopedTimer stream_timer(PerfStats::Timer::StreamWait);
+			Scheduler().Wait(watch.tick);
+		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}
