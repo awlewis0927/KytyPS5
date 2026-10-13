@@ -1163,6 +1163,10 @@ bool TextureCache::TryGpuColorClear(ImageId id, const ImageDesc& desc, uint64_t 
 	}
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
+	if (m_graphics.checkpoints_enabled) {
+		RecordGpuCheckpoint(m_graphics, command.Handle(), 0xEE, first_slice_address, count,
+		                    enabled_mask, extent.width, extent.height, slice_size);
+	}
 	MetaClearDetector::Request request {};
 	request.meta_buffer  = meta->Handle();
 	request.meta_offset  = meta_offset;
