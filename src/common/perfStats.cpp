@@ -135,6 +135,61 @@ void NoteReadbackStack(bool gpu_thread) noexcept {
 #endif
 }
 
+namespace {
+struct HotPage {
+	uint32_t count   = 0;
+	uint32_t threads = 0; // distinct thread ids seen, saturating at a small number
+	uint32_t last_thread = 0;
+};
+std::mutex g_hot_mutex;
+std::array<std::unordered_map<uint64_t, HotPage>, static_cast<size_t>(HotKind::Count)> g_hot;
+
+uint32_t CurrentThreadId() noexcept {
+#if defined(_WIN32)
+	return static_cast<uint32_t>(GetCurrentThreadId());
+#else
+	return 0;
+#endif
+}
+
+void WriteHotPages(FILE* file) {
+	static constexpr const char* names[] = {"guest-readback", "gpu-readback", "write-fault"};
+	std::lock_guard lock(g_hot_mutex);
+	for (size_t kind = 0; kind < g_hot.size(); kind++) {
+		auto& pages = g_hot[kind];
+		if (pages.empty()) {
+			continue;
+		}
+		std::vector<std::pair<uint64_t, HotPage>> sorted(pages.begin(), pages.end());
+		const auto top = (std::min<size_t>)(sorted.size(), 5);
+		std::partial_sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(top),
+		                  sorted.end(), [](const auto& a, const auto& b) {
+			                  return a.second.count > b.second.count;
+		                  });
+		std::fprintf(file, "    hot %s pages=%zu:", names[kind], pages.size());
+		for (size_t i = 0; i < top; i++) {
+			std::fprintf(file, " %llx*%u(t%u/%u)",
+			             static_cast<unsigned long long>(sorted[i].first << 12u),
+			             sorted[i].second.count, sorted[i].second.last_thread,
+			             sorted[i].second.threads);
+		}
+		std::fprintf(file, "\n");
+		pages.clear();
+	}
+}
+} // namespace
+
+void NoteHotAddress(HotKind kind, uint64_t address) noexcept {
+	const auto thread = CurrentThreadId();
+	std::lock_guard lock(g_hot_mutex);
+	auto& page = g_hot[static_cast<size_t>(kind)][address >> 12u];
+	page.count++;
+	if (page.last_thread != thread) {
+		page.threads = (std::min)(page.threads + 1u, 99u);
+		page.last_thread = thread;
+	}
+}
+
 bool TweakEnabled(const char* key, bool default_value) noexcept {
 	const auto& tweaks = Tweaks();
 	const auto  it     = tweaks.find(key);
@@ -262,6 +317,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(indirect),
 	             static_cast<unsigned long long>(async_pipes),
 	             static_cast<unsigned long long>(async_skips));
+	WriteHotPages(g_file);
 	std::fflush(g_file);
 }
 
