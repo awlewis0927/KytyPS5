@@ -589,6 +589,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_texture_cache.NoteGpuBufferWrite(vaddr, size);
+		if (size >= 256 * 1024) {
+			PerfStats::NoteWrittenRange(vaddr, size);
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
