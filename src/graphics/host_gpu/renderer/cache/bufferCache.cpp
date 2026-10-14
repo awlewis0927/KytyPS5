@@ -11,6 +11,8 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+
+#include <unordered_map>
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -731,8 +733,35 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (IsRegionGpuModified(vaddr, size)) {
 		return ObtainBuffer(vaddr, size, false, false);
 	}
+	// "image_upload_cache": an image the guest keeps rewriting was copied in full through the
+	// staging buffer on every change (hundreds of MiB/s in the first level). Once an image has
+	// been staged twice and its range is proven fully mapped (no sparse holes), back it with a
+	// cached buffer instead: later refreshes then copy only the pages the guest actually wrote.
+	static const bool upload_cache = PerfStats::TweakEnabled("image_upload_cache", false);
+	static std::unordered_map<uint64_t, uint32_t> staged_uploads; // GPU thread only
+	constexpr uint32_t Cacheable = 0x7fffffffu;
+	constexpr uint32_t Sparse    = 0x7ffffffeu;
+	uint32_t* staged = nullptr;
+	if (upload_cache && size >= 64 * 1024) {
+		staged = &staged_uploads[vaddr];
+		if (*staged == Cacheable) {
+			staged_uploads.erase(vaddr);
+			return ObtainBuffer(vaddr, size, false, false);
+		}
+		if (*staged != Sparse) {
+			++*staged;
+		}
+	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
+	if (staging != nullptr && staged != nullptr && *staged >= 2 && *staged != Sparse) {
+		// The strict read fails on any unmapped hole; only then fall back to the sparse read.
+		*staged = Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) ? Cacheable : Sparse;
+		if (*staged == Cacheable) {
+			m_staging_buffer.Commit();
+			return {&m_staging_buffer, stage_offset};
+		}
+	}
 	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
