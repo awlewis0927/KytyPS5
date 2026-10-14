@@ -89,6 +89,9 @@ std::atomic_bool                               g_checkpoints_dumped {false};
 void RecordGpuCheckpoint(GraphicContext& /*graphics*/, vk::CommandBuffer buffer, uint32_t op,
                          uint64_t submit_id, uint32_t arg0, uint32_t arg1, uint32_t arg2,
                          uint32_t arg3, uint64_t arg4) {
+	if (!PerfStats::CheckpointsArmed()) {
+		return;
+	}
 	const auto seq = g_checkpoint_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	auto&      rec = g_checkpoints[seq % CheckpointRing];
 	rec            = {seq, submit_id, arg4, op, arg0, arg1, arg2, arg3};
