@@ -79,6 +79,11 @@ void NoteWrittenRange(uint64_t address, uint64_t size) noexcept;
 // CPU->GPU image uploads (whole-image re-uploads after guest writes), keyed by base address.
 // reason bits: 1 = buffer-modified, 2 = guest-written, 4 = possibly guest-written (edge page).
 void NoteImageUpload(uint64_t address, uint64_t size, uint32_t reason) noexcept;
+// GPU execution time from timestamp queries. kind: 1 draw, 2 mesh draw, 3 dispatch,
+// 0xFE whole command buffer, 0xFF tail after the last draw/dispatch; key is the shader hash.
+void NoteGpuTime(uint32_t kind, uint64_t key, uint64_t nanoseconds) noexcept;
+// Why a GPU-side indirect draw fell back to the CPU path (reason < 16).
+void NoteIndirectFallback(uint32_t reason) noexcept;
 
 // Starts a ~1 kHz stack sampler for the calling thread (the GPU command thread); stacks are
 // written to _gpu_profile.log every few seconds. Windows only; "gpu_profiler=0" disables it.

@@ -242,6 +242,77 @@ void WriteImageUploads(FILE* file) {
 	g_image_uploads.clear();
 }
 
+struct GpuTimeEntry {
+	uint64_t ns    = 0;
+	uint32_t count = 0;
+};
+std::unordered_map<uint64_t, GpuTimeEntry> g_gpu_time_keys;
+std::array<uint64_t, 4>                    g_gpu_time_kinds {};
+uint64_t                                   g_gpu_time_total = 0;
+uint64_t                                   g_gpu_time_tail  = 0;
+uint32_t                                   g_gpu_time_cmdbufs = 0;
+std::array<std::atomic_uint32_t, 16>       g_indirect_fallbacks {};
+
+void NoteGpuTime(uint32_t kind, uint64_t key, uint64_t nanoseconds) noexcept {
+	std::lock_guard lock(g_hot_mutex);
+	if (kind == 0xFEu) {
+		g_gpu_time_total += nanoseconds;
+		g_gpu_time_cmdbufs++;
+		return;
+	}
+	if (kind == 0xFFu) {
+		g_gpu_time_tail += nanoseconds;
+		return;
+	}
+	if (kind >= g_gpu_time_kinds.size()) {
+		return;
+	}
+	g_gpu_time_kinds[kind] += nanoseconds;
+	auto& entry = g_gpu_time_keys[(static_cast<uint64_t>(kind) << 60u) ^ (key & 0x0fffffffffffffffull)];
+	entry.ns += nanoseconds;
+	entry.count++;
+}
+
+void NoteIndirectFallback(uint32_t reason) noexcept {
+	g_indirect_fallbacks[reason & 15u].fetch_add(1, std::memory_order_relaxed);
+}
+
+void WriteGpuTime(FILE* file) {
+	std::string fallbacks;
+	for (auto& counter: g_indirect_fallbacks) {
+		fallbacks += std::to_string(counter.exchange(0, std::memory_order_relaxed));
+		fallbacks += ',';
+	}
+	std::lock_guard lock(g_hot_mutex);
+	std::fprintf(file,
+	             "    gpu-time cmdbufs=%u total=%llums draw=%llums mesh=%llums dispatch=%llums "
+	             "tail=%llums | gi-fail=%s:",
+	             g_gpu_time_cmdbufs, static_cast<unsigned long long>(g_gpu_time_total / 1000000u),
+	             static_cast<unsigned long long>(g_gpu_time_kinds[1] / 1000000u),
+	             static_cast<unsigned long long>(g_gpu_time_kinds[2] / 1000000u),
+	             static_cast<unsigned long long>(g_gpu_time_kinds[3] / 1000000u),
+	             static_cast<unsigned long long>(g_gpu_time_tail / 1000000u), fallbacks.c_str());
+	std::vector<std::pair<uint64_t, GpuTimeEntry>> sorted(g_gpu_time_keys.begin(),
+	                                                      g_gpu_time_keys.end());
+	const auto top = (std::min<size_t>)(sorted.size(), 10);
+	std::partial_sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(top),
+	                  sorted.end(),
+	                  [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+	static constexpr const char* kinds[] = {"?", "d", "m", "c"};
+	for (size_t i = 0; i < top; i++) {
+		std::fprintf(file, " %s%llx=%lluus/%u", kinds[sorted[i].first >> 60u],
+		             static_cast<unsigned long long>(sorted[i].first & 0x0fffffffffffffffull),
+		             static_cast<unsigned long long>(sorted[i].second.ns / 1000u),
+		             sorted[i].second.count);
+	}
+	std::fprintf(file, "\n");
+	g_gpu_time_keys.clear();
+	g_gpu_time_kinds.fill(0);
+	g_gpu_time_total   = 0;
+	g_gpu_time_tail    = 0;
+	g_gpu_time_cmdbufs = 0;
+}
+
 void NoteImageUpload(uint64_t address, uint64_t size, uint32_t reason) noexcept {
 	std::lock_guard lock(g_hot_mutex);
 	auto& upload = g_image_uploads[address];
@@ -622,6 +693,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	WriteHotPages(g_file);
 	WriteWrittenRanges(g_file);
 	WriteImageUploads(g_file);
+	WriteGpuTime(g_file);
 	std::fflush(g_file);
 }
 
