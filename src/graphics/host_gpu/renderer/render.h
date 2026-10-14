@@ -57,6 +57,15 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// GPU-side indirect draw (non-zero args address): the draw arguments stay in GPU memory and
+	// are consumed by vkCmdDrawIndexedIndirect[Count]; index_addr/index_count describe the whole
+	// index buffer and instance_count is ignored.
+	uint64_t indirect_args_addr     = 0;
+	uint64_t indirect_count_addr    = 0;
+	uint32_t indirect_stride        = 0;
+	uint32_t indirect_max_count     = 0;
+	int32_t  indirect_vertex_slot   = -1;
+	int32_t  indirect_instance_slot = -1;
 };
 
 struct DrawAutoArgs {
@@ -163,7 +172,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	// Returns false only for a GPU-side indirect draw it cannot record (the caller then reads the
+	// arguments on the CPU and issues direct draws).
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
