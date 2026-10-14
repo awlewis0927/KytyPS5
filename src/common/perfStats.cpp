@@ -528,6 +528,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	const auto async_skips   = Take(Counter::AsyncSkippedDraws);
 	const auto relaxed       = Take(Counter::RelaxedFaults);
 	const auto stable        = Take(Counter::StableSkips);
+	const auto gpu_indirect  = Take(Counter::GpuIndirectDraws);
 
 	if (g_file == nullptr) {
 		return;
@@ -539,7 +540,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             "faults r=%llu w=%llu %llums | async-wait=%llu retries=%llu | draw n=%llu %llums "
 	             "dispatch n=%llu %llums | pipeline=%llu bufsync=%llu texfind=%llu | "
 	             "meta read=%llu skip=%llu gpu=%llu cached=%llu | srt=%llu pipe=%llu bind=%llu rt=%llu "
-	             "commit=%llu | unmap-drain=%llu indirect=%llu | async-pipes=%llu skipped=%llu | relaxed=%llu stable=%llu\n",
+	             "commit=%llu | unmap-drain=%llu indirect=%llu | async-pipes=%llu skipped=%llu | relaxed=%llu stable=%llu gpu-indirect=%llu\n",
 	             static_cast<double>(g_total_ms) / 1000.0,
 	             static_cast<unsigned long long>(elapsed_ms), fps,
 	             static_cast<unsigned long long>(gpu_busy), static_cast<unsigned long long>(gpu_idle),
@@ -574,7 +575,8 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(indirect),
 	             static_cast<unsigned long long>(async_pipes),
 	             static_cast<unsigned long long>(async_skips),
-	             static_cast<unsigned long long>(relaxed), static_cast<unsigned long long>(stable));
+	             static_cast<unsigned long long>(relaxed), static_cast<unsigned long long>(stable),
+	             static_cast<unsigned long long>(gpu_indirect));
 	WriteHotPages(g_file);
 	WriteWrittenRanges(g_file);
 	std::fflush(g_file);
