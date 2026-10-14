@@ -54,6 +54,7 @@ enum class Counter : uint32_t {
 	AsyncPipelines,    // graphics pipelines queued for background compilation
 	AsyncSkippedDraws, // draws skipped because their pipeline was still compiling
 	RelaxedFaults,     // guest faults on shared GPU/CPU pages served without a stall
+	StableSkips,       // guest faults on GPU-unchanged pages served without a readback
 	Count
 };
 
