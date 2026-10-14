@@ -115,6 +115,45 @@ void DumpGpuCheckpoints(GraphicContext& graphics, const char* reason) {
 		return;
 	}
 	std::string text = std::string("GPU failure: ") + reason + "\n";
+	if (graphics.device_fault_enabled &&
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT != nullptr) {
+		// VK_EXT_device_fault: distinguishes a GPU page fault (bad address) from a timeout.
+		VkDeviceFaultCountsEXT counts {};
+		counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(graphics.device, &counts, nullptr);
+		std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+		std::vector<VkDeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+		counts.vendorBinarySize = 0;
+		VkDeviceFaultInfoEXT info {};
+		info.sType             = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+		info.pAddressInfos     = addresses.empty() ? nullptr : addresses.data();
+		info.pVendorInfos      = vendors.empty() ? nullptr : vendors.data();
+		const auto fault_result =
+		    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(graphics.device, &counts, &info);
+		char fault_line[512];
+		std::snprintf(fault_line, sizeof(fault_line),
+		              "device fault (result %d): %s | addresses=%u vendor=%u\n",
+		              static_cast<int>(fault_result), info.description, counts.addressInfoCount,
+		              counts.vendorInfoCount);
+		text += fault_line;
+		for (uint32_t i = 0; i < counts.addressInfoCount && i < addresses.size(); i++) {
+			std::snprintf(fault_line, sizeof(fault_line),
+			              "  address type=%d addr=0x%llx precision=0x%llx\n",
+			              static_cast<int>(addresses[i].addressType),
+			              static_cast<unsigned long long>(addresses[i].reportedAddress),
+			              static_cast<unsigned long long>(addresses[i].addressPrecision));
+			text += fault_line;
+		}
+		for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); i++) {
+			std::snprintf(fault_line, sizeof(fault_line), "  vendor: %s code=0x%llx data=0x%llx\n",
+			              vendors[i].description,
+			              static_cast<unsigned long long>(vendors[i].vendorFaultCode),
+			              static_cast<unsigned long long>(vendors[i].vendorFaultData));
+			text += fault_line;
+		}
+	} else {
+		text += "device fault info unavailable\n";
+	}
 	if (!graphics.checkpoints_enabled ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV == nullptr) {
 		text += "checkpoints unavailable\n";
