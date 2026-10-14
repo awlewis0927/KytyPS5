@@ -15,6 +15,14 @@
 
 namespace Libs::Graphics {
 
+// "gpu_timing": timestamp queries around draws and dispatches in the heavy level (armed together
+// with the low-fps diagnostics), aggregated per shader into _perf.log. GPU command thread only.
+namespace GpuTiming {
+enum Kind : uint32_t { Draw = 1, MeshDraw = 2, Dispatch = 3 };
+// Records the completion time of the preceding draw/dispatch in the current command buffer.
+void Stamp(vk::CommandBuffer buffer, uint32_t kind, uint64_t key) noexcept;
+} // namespace GpuTiming
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);

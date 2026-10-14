@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
+#include <vector>
 #include <cstdio>
 #include <optional>
 
@@ -30,6 +32,124 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 }
 
 } // namespace
+
+namespace GpuTiming {
+namespace {
+
+constexpr uint32_t ChunkSize  = 4096;
+constexpr uint32_t ChunkCount = 16;
+constexpr uint32_t BeginKind  = 0xF0u;
+constexpr uint32_t EndKind    = 0xFFu;
+
+struct Tag {
+	uint32_t kind = 0;
+	uint64_t key  = 0;
+};
+
+struct Chunk {
+	bool             busy = false;
+	uint32_t         used = 0;
+	std::vector<Tag> tags;
+};
+
+vk::Device                       g_device;
+vk::QueryPool                    g_pool;
+double                           g_period_ns = 1.0;
+bool                             g_initialized = false;
+bool                             g_disabled    = false;
+std::array<Chunk, ChunkCount>    g_chunks;
+int32_t                          g_current = -1;
+vk::CommandBuffer                g_buffer;
+
+void Begin(GraphicContext& graphics, vk::CommandBuffer buffer) {
+	static const bool enabled = PerfStats::TweakEnabled("gpu_timing", true);
+	g_current = -1;
+	if (!enabled || g_disabled || !PerfStats::CheckpointsArmed()) {
+		return;
+	}
+	if (!g_initialized) {
+		g_initialized = true;
+		vk::QueryPoolCreateInfo create {};
+		create.queryType  = vk::QueryType::eTimestamp;
+		create.queryCount = ChunkSize * ChunkCount;
+		g_device          = graphics.device;
+		g_period_ns       = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		if (g_device.createQueryPool(&create, nullptr, &g_pool) != vk::Result::eSuccess ||
+		    g_period_ns <= 0.0) {
+			g_disabled = true;
+			return;
+		}
+		for (auto& chunk: g_chunks) {
+			chunk.tags.resize(ChunkSize);
+		}
+	}
+	for (uint32_t i = 0; i < ChunkCount; i++) {
+		if (!g_chunks[i].busy) {
+			g_current = static_cast<int32_t>(i);
+			break;
+		}
+	}
+	if (g_current < 0) {
+		return;
+	}
+	auto& chunk = g_chunks[g_current];
+	chunk.busy  = true;
+	chunk.used  = 0;
+	g_buffer    = buffer;
+	buffer.resetQueryPool(g_pool, static_cast<uint32_t>(g_current) * ChunkSize, ChunkSize);
+	Stamp(buffer, BeginKind, 0);
+}
+
+int32_t End(vk::CommandBuffer buffer) {
+	if (g_current < 0 || buffer != g_buffer) {
+		return -1;
+	}
+	Stamp(buffer, EndKind, 0);
+	const auto chunk = g_current;
+	g_current        = -1;
+	return chunk;
+}
+
+void Harvest(int32_t index) {
+	auto& chunk = g_chunks[index];
+	if (chunk.used >= 2) {
+		std::vector<uint64_t> values(chunk.used);
+		const auto result = g_device.getQueryPoolResults(
+		    g_pool, static_cast<uint32_t>(index) * ChunkSize, chunk.used,
+		    values.size() * sizeof(uint64_t), values.data(), sizeof(uint64_t),
+		    vk::QueryResultFlagBits::e64);
+		if (result == vk::Result::eSuccess) {
+			const auto to_ns = [](uint64_t ticks) {
+				return static_cast<uint64_t>(static_cast<double>(ticks) * g_period_ns);
+			};
+			for (uint32_t i = 1; i < chunk.used; i++) {
+				const auto delta = values[i] >= values[i - 1] ? values[i] - values[i - 1] : 0;
+				PerfStats::NoteGpuTime(chunk.tags[i].kind, chunk.tags[i].key, to_ns(delta));
+			}
+			if (values[chunk.used - 1] >= values[0]) {
+				PerfStats::NoteGpuTime(0xFEu, 0, to_ns(values[chunk.used - 1] - values[0]));
+			}
+		}
+	}
+	chunk.busy = false;
+}
+
+} // namespace
+
+void Stamp(vk::CommandBuffer buffer, uint32_t kind, uint64_t key) noexcept {
+	if (g_current < 0 || buffer != g_buffer) {
+		return;
+	}
+	auto& chunk = g_chunks[g_current];
+	if (chunk.used >= ChunkSize - 1 && kind != EndKind) {
+		return;
+	}
+	buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, g_pool,
+	                      static_cast<uint32_t>(g_current) * ChunkSize + chunk.used);
+	chunk.tags[chunk.used++] = {kind, key};
+}
+
+} // namespace GpuTiming
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -340,6 +460,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	GpuTiming::Begin(m_graphics, m_command.m_buffer);
 	return m_command;
 }
 
@@ -348,6 +469,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (const auto chunk = GpuTiming::End(m_command.m_buffer); chunk >= 0) {
+		if (Active()) {
+			DeferOperation([chunk] { GpuTiming::Harvest(chunk); });
+		} else {
+			GpuTiming::Harvest(chunk); // not submitted yet: frees the chunk without results
+		}
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

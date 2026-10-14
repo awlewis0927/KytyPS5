@@ -1293,6 +1293,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	{
+		const auto* timed = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                        ? state.ps_input_info.stage.program
+		                        : state.vertex_info[0].stage.program;
+		GpuTiming::Stamp(vk_buffer, mesh_active ? GpuTiming::MeshDraw : GpuTiming::Draw,
+		                 timed != nullptr ? timed->shader_hash : 0);
+	}
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1334,6 +1341,13 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		        Prospero::IndexType::kIndex8 ||
 		    buffer.GetRegisters().GetRenderControl().copy_depth_to_color ||
 		    args.indirect_stride < 20 || args.indirect_max_count == 0) {
+			PerfStats::NoteIndirectFallback(
+			    !m_context.GetGraphics().gpu_indirect_draws_supported ? 6u
+			    : prim == Prospero::PrimitiveType::kQuadListLegacy     ? 7u
+			    : Prospero::IsRectList(prim)                           ? 8u
+			    : prim == Prospero::PrimitiveType::kPatch              ? 9u
+			    : buffer.GetRegisters().GetRenderControl().copy_depth_to_color ? 10u
+			                                                           : 11u);
 			return false;
 		}
 	}
@@ -1434,6 +1448,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                     state.vertex_info[0].logical_stage != ShaderType::Vertex ||
 	                     !state.vertex_info[0].indirect_draw)) {
 		// Mesh or tessellation pipelines take their draw sizes from the CPU.
+		PerfStats::NoteIndirectFallback(
+		    state.programs.VertexStageCount() != 1                          ? 12u
+		    : state.vertex_info[0].logical_stage != ShaderType::Vertex      ? 13u
+		                                                                     : 14u);
 		ResetBindings();
 		return false;
 	}
