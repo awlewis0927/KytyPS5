@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "common/perfStats.h"
 
 #include <algorithm>
 #include <bit>
@@ -88,6 +89,60 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// Returns the guarded branch condition for a loop exit branch: once the invocation has evaluated
+// LoopGuardLimit loop exits, the exit is forced.
+uint32_t GuardLoopExit(ValueEmitContext& ctx, const IR::Block* block, uint32_t condition) {
+	constexpr uint32_t LoopGuardLimit = 1u << 20;
+	auto&              state          = ctx.state;
+	if (state.loop_guard_variable == 0) {
+		return condition;
+	}
+	const auto& term       = block->terminator;
+	const auto* true_block = term.true_block;
+	const auto* false_block = term.false_block;
+	bool        exit_on_true = false;
+	bool        found        = false;
+	if (term.loop_header && term.merge_block != nullptr) {
+		if (true_block == term.merge_block) {
+			exit_on_true = true;
+			found        = true;
+		} else if (false_block == term.merge_block) {
+			found = true;
+		}
+	}
+	if (!found) {
+		// A latch: one target is a loop header and the other that loop's merge block.
+		if (false_block->terminator.loop_header && false_block->terminator.merge_block == true_block) {
+			exit_on_true = true;
+			found        = true;
+		} else if (true_block->terminator.loop_header &&
+		           true_block->terminator.merge_block == false_block) {
+			found = true;
+		}
+	}
+	if (!found) {
+		return condition;
+	}
+	const auto u32   = TypeU32(state);
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u32, count, state.loop_guard_variable);
+	const auto next = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIAdd, u32, next, count, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, next);
+	const auto over = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), over, next,
+	                          ConstantU32(state, LoopGuardLimit));
+	const auto guarded = state.builder.AllocateId();
+	if (exit_on_true) {
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), guarded, condition, over);
+	} else {
+		const auto stay = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), stay, over);
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), guarded, condition, stay);
+	}
+	return guarded;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
@@ -123,7 +178,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			const auto condition = GuardLoopExit(ctx, block, ctx.Def(block->condition));
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -672,6 +727,11 @@ void EmitProgram(EmitterState& state) {
 			high.scratch_u32_variable = state.builder.AllocateId();
 		}
 	}
+	static const bool loop_guard = PerfStats::TweakEnabled("loop_guard", true);
+	if (loop_guard && program.stage == ShaderType::Compute && !state.program.dispatcher_fallback &&
+	    !program.blocks.empty()) {
+		state.loop_guard_variable = state.builder.AllocateId();
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
@@ -694,6 +754,11 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
+	}
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_guard_variable, spv::StorageClassFunction);
 	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
@@ -723,6 +788,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
