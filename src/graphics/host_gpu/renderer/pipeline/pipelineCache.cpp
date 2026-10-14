@@ -784,7 +784,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		if (m_pending_indirect) {
+			vertex_info[0].indirect_draw          = true;
+			vertex_info[0].indirect_vertex_slot   = m_pending_indirect_vertex;
+			vertex_info[0].indirect_instance_slot = m_pending_indirect_instance;
+		}
 	}
+	m_pending_indirect = false;
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);

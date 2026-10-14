@@ -116,6 +116,13 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 
+	// The next GetGraphicsPrograms call compiles the vertex stage for a GPU-side indirect draw.
+	void SetPendingIndirectDraw(int32_t vertex_slot, int32_t instance_slot) noexcept {
+		m_pending_indirect          = true;
+		m_pending_indirect_vertex   = vertex_slot;
+		m_pending_indirect_instance = instance_slot;
+	}
+
 	// Result slot of a graphics pipeline compiled on a worker thread.
 	struct AsyncPipelineResult {
 		std::atomic<bool> done {false};
@@ -187,6 +194,9 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	bool                          m_pending_indirect          = false;
+	int32_t                       m_pending_indirect_vertex   = -1;
+	int32_t                       m_pending_indirect_instance = -1;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
