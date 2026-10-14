@@ -907,6 +907,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// "gpu_indirect_draws": let the GPU consume the argument array (and count) it wrote, instead
 	// of reading them back on the CPU, which drains the whole GPU for every indirect draw.
 	static const bool gpu_indirect = PerfStats::TweakEnabled("gpu_indirect_draws", false);
+	if (gpu_indirect) {
+		// Diagnostics: why a packet stays on the CPU path (see gi-fail in _perf.log).
+		PerfStats::NoteIndirectFallback(
+		    !indexed                              ? 0u
+		    : m_index_buffer_size == 0            ? 1u
+		    : m_index_type_and_size == 2          ? 2u
+		    : registers.index_offset != Pm4::SH_NOP ? 3u
+		    : max_count_or_count == 0             ? 4u
+		                                          : 15u);
+	}
 	if (gpu_indirect && indexed && m_index_buffer_size != 0 && m_index_type_and_size != 2 &&
 	    registers.index_offset == Pm4::SH_NOP && max_count_or_count != 0) {
 		// The base vertex/instance user-data registers become shader reads of gl_BaseVertex /
@@ -923,6 +933,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		};
 		const auto vertex_slot   = slot_of(registers.vertex_offset);
 		const auto instance_slot = slot_of(registers.instance_offset);
+		if (vertex_slot == -2 || instance_slot == -2) {
+			PerfStats::NoteIndirectFallback(5u);
+		}
 		if (vertex_slot != -2 && instance_slot != -2) {
 			DrawIndexArgs gpu_args {
 			    .index_count         = m_index_buffer_size,
