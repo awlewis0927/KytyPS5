@@ -149,6 +149,11 @@ void RecordGpuCheckpoint(GraphicContext& graphics, vk::CommandBuffer buffer, uin
                          uint64_t submit_id, uint32_t arg0, uint32_t arg1, uint32_t arg2,
                          uint32_t arg3, uint64_t arg4);
 void DumpGpuCheckpoints(GraphicContext& graphics, const char* reason);
+// Sequence number of the newest recorded checkpoint (0 while unarmed).
+uint64_t LastGpuCheckpointSeq();
+// Host-visible ring (8192 x 16 bytes, indexed by checkpoint seq) holding GPU copies of indirect
+// dispatch arguments, printed with the hang report; invalidate makes GPU writes visible.
+void SetCheckpointArgsRing(const uint32_t* mapped, void (*invalidate)());
 
 } // namespace Libs::Graphics
 
