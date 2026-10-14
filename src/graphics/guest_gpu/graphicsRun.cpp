@@ -904,6 +904,46 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	// "gpu_indirect_draws": let the GPU consume the argument array (and count) it wrote, instead
+	// of reading them back on the CPU, which drains the whole GPU for every indirect draw.
+	static const bool gpu_indirect = PerfStats::TweakEnabled("gpu_indirect_draws", false);
+	if (gpu_indirect && indexed && m_index_buffer_size != 0 && m_index_type_and_size != 2 &&
+	    registers.index_offset == Pm4::SH_NOP && max_count_or_count != 0) {
+		// The base vertex/instance user-data registers become shader reads of gl_BaseVertex /
+		// gl_BaseInstance; only the vertex shader's user data (GS slots) is supported.
+		const auto slot_of = [](uint32_t location) -> int32_t {
+			if (location == Pm4::SH_NOP) {
+				return -1;
+			}
+			if (location >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
+			    location < Pm4::SPI_SHADER_USER_DATA_GS_0 + 32u) {
+				return static_cast<int32_t>(location - Pm4::SPI_SHADER_USER_DATA_GS_0);
+			}
+			return -2;
+		};
+		const auto vertex_slot   = slot_of(registers.vertex_offset);
+		const auto instance_slot = slot_of(registers.instance_offset);
+		if (vertex_slot != -2 && instance_slot != -2) {
+			DrawIndexArgs gpu_args {
+			    .index_count         = m_index_buffer_size,
+			    .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+			    .instance_count      = 1,
+			    .index_type_and_size = m_index_type_and_size,
+			    .offset_source       = DrawOffsetSource::IndirectArgs,
+			    .indirect_args_addr  = m_draw_indirect_args_base_addr + data_offset,
+			    .indirect_count_addr = reinterpret_cast<uint64_t>(count_addr),
+			    .indirect_stride     = stride_in_bytes,
+			    .indirect_max_count  = max_count_or_count,
+			    .indirect_vertex_slot   = vertex_slot,
+			    .indirect_instance_slot = instance_slot,
+			};
+			if (m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), gpu_args)) {
+				PerfStats::Add(PerfStats::Counter::GpuIndirectDraws);
+				return;
+			}
+		}
+	}
+
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		draw_count = *count_addr;
