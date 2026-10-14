@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -33,6 +34,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 #include <xxhash.h>
 
@@ -125,8 +127,42 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	if (values.empty()) {
+		return false;
+	}
+	// "stable_srt_reads": resource tables the GPU rewrites every frame with the same contents
+	// would force a full GPU drain per draw. Once a table read has returned identical words four
+	// times in a row, serve it from the last published copy, re-verifying every 16th read.
+	static const bool stable_srt = PerfStats::TweakEnabled("stable_srt_reads", false);
+	if (!stable_srt || !GuestGpu::IsGpuThread()) {
+		return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+		                                                     values.size_bytes());
+	}
+	struct StableRead {
+		std::vector<uint32_t> last;
+		uint32_t              streak = 0;
+		uint32_t              uses   = 0;
+	};
+	static std::unordered_map<uint64_t, StableRead> reads; // GPU thread only
+	auto& entry = reads[address ^ (static_cast<uint64_t>(values.size()) << 48u)];
+	if (entry.streak >= 4 && (++entry.uses % 16) != 0 &&
+	    Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		PerfStats::Add(PerfStats::Counter::StableSkips);
+		return true;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                   values.size_bytes())) {
+		return false;
+	}
+	if (entry.last.size() == values.size() &&
+	    std::equal(values.begin(), values.end(), entry.last.begin())) {
+		entry.streak = std::min<uint32_t>(entry.streak + 1, 1000);
+	} else {
+		entry.last.assign(values.begin(), values.end());
+		entry.streak = 0;
+		entry.uses   = 0;
+	}
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
