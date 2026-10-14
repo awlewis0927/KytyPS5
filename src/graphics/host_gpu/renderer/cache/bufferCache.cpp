@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -210,6 +211,33 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	auto publish = [this, mapped, offset, total_size, buffer_address, track_pending,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		if (m_skip_stable) {
+			// Compare small readbacks with what the CPU already has, page by page.
+			std::array<uint8_t, TRACKER_PAGE_SIZE> current {};
+			std::scoped_lock                       stable_lock(m_stable_mutex);
+			for (const auto& copy: copies) {
+				if (copy.size > 64 * 1024) {
+					continue;
+				}
+				const auto begin = buffer_address + copy.srcOffset;
+				const auto end   = begin + copy.size;
+				for (auto at = begin; at < end;) {
+					const auto page  = at & ~(TRACKER_PAGE_SIZE - 1);
+					const auto chunk = std::min(end, page + TRACKER_PAGE_SIZE) - at;
+					const auto* data = mapped + (copy.dstOffset - offset) + (at - begin);
+					const bool  same =
+					    Libs::LibKernel::Memory::TryReadBufferBacking(at, current.data(), chunk) &&
+					    std::memcmp(current.data(), data, chunk) == 0;
+					if (same) {
+						auto& streak = m_stable_streak[page];
+						streak       = std::min<uint32_t>(streak + 1, 1000);
+					} else {
+						m_stable_streak.erase(page);
+					}
+					at += chunk;
+				}
+			}
+		}
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
@@ -249,6 +277,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	m_async_readback   = PerfStats::TweakEnabled("async_readback", true);
 	m_relax_edge_pages = PerfStats::TweakEnabled("relax_edge_pages", false);
+	m_skip_stable      = PerfStats::TweakEnabled("skip_stable_readbacks", false);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -309,6 +338,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto page_begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto page_size  = ((vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1)) -
 	                       page_begin;
+	if (m_skip_stable && !GuestGpu::IsGpuThread()) {
+		bool stable = false;
+		{
+			std::scoped_lock stable_lock(m_stable_mutex);
+			const auto       it = m_stable_streak.find(page_begin);
+			// Re-verify with a real readback every 16th fault on a stable page.
+			stable = page_size == TRACKER_PAGE_SIZE && it != m_stable_streak.end() &&
+			         it->second >= 4 && (++m_stable_probe[page_begin] % 16) != 0;
+		}
+		if (stable) {
+			bool skipped = false;
+			gpu.SendCommandSync([&] {
+				if (m_inflight_readbacks.Intersects(page_begin, page_size) ||
+				    (is_write && !IsRegionRegistered(vaddr, size))) {
+					return;
+				}
+				// The GPU has kept returning the CPU's own bytes for this page: treat it as CPU data.
+				m_gpu_modified_ranges.Subtract(page_begin, page_size);
+				m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_size);
+				if (is_write) {
+					m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				}
+				PerfStats::Add(PerfStats::Counter::StableSkips);
+				skipped = true;
+			});
+			if (skipped) {
+				return;
+			}
+		}
+	}
 	if (m_relax_edge_pages) {
 		bool relaxed = false;
 		gpu.SendCommandSync([&] {

@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -143,6 +144,13 @@ private:
 	// them so stale CPU copies never overwrite newer GPU data.
 	std::mutex                                        m_pending_publish_mutex;
 	RangeSet                                          m_pending_publish;
+	// "skip_stable_readbacks": per 4 KiB page, how many readbacks in a row returned exactly the
+	// bytes the CPU already had (GPU-owned in name only, e.g. an over-sized buffer binding).
+	// Faults on such pages skip the readback, re-verifying every few faults.
+	bool                                              m_skip_stable = false;
+	std::mutex                                        m_stable_mutex;
+	std::unordered_map<uint64_t, uint32_t>            m_stable_streak;
+	std::unordered_map<uint64_t, uint32_t>            m_stable_probe;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
