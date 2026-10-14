@@ -603,6 +603,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
+	key.push_back(static_cast<uint32_t>(info.indirect_draw));
+	key.push_back(static_cast<uint32_t>(info.indirect_vertex_slot));
+	key.push_back(static_cast<uint32_t>(info.indirect_instance_slot));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);

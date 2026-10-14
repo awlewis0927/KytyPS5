@@ -143,6 +143,11 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// GPU-side indirect draw: Vulkan supplies base vertex/instance, so native vertex/instance
+	// indices subtract them and these user-data slots (-1: none) read gl_BaseVertex/Instance.
+	bool                    indirect_draw            = false;
+	int32_t                 indirect_vertex_slot     = -1;
+	int32_t                 indirect_instance_slot   = -1;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
