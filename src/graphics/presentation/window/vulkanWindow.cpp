@@ -500,7 +500,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext = supported_features2.pNext;
 		supported_features2.pNext = &conditional_rendering;
 	}
+	const bool device_fault_extension =
+	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (device_fault_extension) {
+		device_fault.pNext        = supported_features2.pNext;
+		supported_features2.pNext = &device_fault;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.device_fault_enabled = device_fault_extension && device_fault.deviceFault;
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
@@ -663,6 +671,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.depth_color_copy_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.device_fault_enabled) {
+		device_fault.pNext                   = const_cast<void*>(create_info.pNext);
+		device_fault.deviceFaultVendorBinary = VK_FALSE;
+		create_info.pNext                    = &device_fault;
 	}
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext                         = const_cast<void*>(create_info.pNext);
@@ -1053,6 +1066,9 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME) &&
 		    PerfStats::TweakEnabled("gpu_checkpoints", true)) {
