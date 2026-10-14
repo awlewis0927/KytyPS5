@@ -92,7 +92,7 @@ void EmitReturn(ValueEmitContext& ctx) {
 // Returns the guarded branch condition for a loop exit branch: once the invocation has evaluated
 // LoopGuardLimit loop exits, the exit is forced.
 uint32_t GuardLoopExit(ValueEmitContext& ctx, const IR::Block* block, uint32_t condition) {
-	constexpr uint32_t LoopGuardLimit = 1u << 20;
+	constexpr uint32_t LoopGuardLimit = 1u << 16;
 	auto&              state          = ctx.state;
 	if (state.loop_guard_variable == 0) {
 		return condition;
@@ -111,12 +111,12 @@ uint32_t GuardLoopExit(ValueEmitContext& ctx, const IR::Block* block, uint32_t c
 		}
 	}
 	if (!found) {
-		// A latch: one target is a loop header and the other that loop's merge block.
-		if (false_block->terminator.loop_header && false_block->terminator.merge_block == true_block) {
+		// Any branch that can leave a loop: one target is some loop's merge block (a break or
+		// latch exit). Forcing it from outside that loop only skips the loop, also harmless.
+		if (state.loop_merge_blocks.contains(true_block)) {
 			exit_on_true = true;
 			found        = true;
-		} else if (true_block->terminator.loop_header &&
-		           true_block->terminator.merge_block == false_block) {
+		} else if (state.loop_merge_blocks.contains(false_block)) {
 			found = true;
 		}
 	}
@@ -379,6 +379,13 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	if (ctx.state.loop_guard_variable != 0) {
+		for (const auto* block: program.blocks) {
+			if (block->terminator.loop_header && block->terminator.merge_block != nullptr) {
+				ctx.state.loop_merge_blocks.insert(block->terminator.merge_block);
+			}
+		}
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
@@ -410,9 +417,23 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto done = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	auto exit_dispatch = done;
+	if (state.loop_guard_variable != 0) {
+		// loop_guard: stop the block dispatcher after 4M executed blocks.
+		const auto count = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.loop_guard_variable);
+		const auto next = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next, count, ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, next);
+		const auto over = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), over, next,
+		                          ConstantU32(state, 1u << 22));
+		exit_dispatch = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), exit_dispatch, done, over);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
+	state.builder.AddFunction(spv::OpBranchConditional, exit_dispatch, dispatcher.merge_label,
 	                          dispatcher.select_label);
 
 	EmitLabel(state, dispatcher.select_label);
@@ -728,8 +749,7 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	static const bool loop_guard = PerfStats::TweakEnabled("loop_guard", true);
-	if (loop_guard && program.stage == ShaderType::Compute && !state.program.dispatcher_fallback &&
-	    !program.blocks.empty()) {
+	if (loop_guard && program.stage == ShaderType::Compute && !program.blocks.empty()) {
 		state.loop_guard_variable = state.builder.AllocateId();
 	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),

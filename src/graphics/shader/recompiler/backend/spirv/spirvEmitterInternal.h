@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -141,6 +142,7 @@ struct EmitterState {
 	// "loop_guard": per-invocation count of loop exit-branch evaluations in compute shaders;
 	// past the limit every loop takes its exit, so a spin-wait cannot hang the GPU (TDR).
 	uint32_t                   loop_guard_variable                   = 0;
+	std::unordered_set<const IR::Block*> loop_merge_blocks;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
