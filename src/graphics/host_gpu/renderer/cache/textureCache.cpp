@@ -1047,6 +1047,10 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		PerfStats::NoteImageUpload(image.info.data.address, image.info.data.size,
+		                           (image.IsBufferModified() ? 1u : 0u) |
+		                               (image.IsDefinitelyCpuDirty() ? 2u : 0u) |
+		                               (image.IsMaybeCpuDirty() ? 4u : 0u));
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
