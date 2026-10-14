@@ -507,6 +507,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.pNext        = supported_features2.pNext;
 		supported_features2.pNext = &device_fault;
 	}
+	vk::PhysicalDeviceVulkan11Features supported_features11 {};
+	supported_features11.pNext = supported_features2.pNext;
+	supported_features2.pNext  = &supported_features11;
 	physical_device.getFeatures2(&supported_features2);
 	graphics.device_fault_enabled = device_fault_extension && device_fault.deviceFault;
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
@@ -526,6 +529,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	auto features11 = WindowContext::RequiredVulkan11Features();
 	features11.pNext = features12.pNext;
 	features12.pNext = &features11;
+	// GPU-side indirect draws: draw parameters in shaders plus count/multi-draw indirect.
+	features11.shaderDrawParameters = supported_features11.shaderDrawParameters;
+	features12.drawIndirectCount    = supported_features12.drawIndirectCount;
+	graphics.gpu_indirect_draws_supported =
+	    supported_features11.shaderDrawParameters && supported_features12.drawIndirectCount &&
+	    supported_features2.features.multiDrawIndirect;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -607,6 +616,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	device_features.multiDrawIndirect = supported_features2.features.multiDrawIndirect;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
