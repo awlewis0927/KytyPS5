@@ -76,6 +76,9 @@ enum class HotKind : uint32_t { GuestReadback, GpuReadback, WriteFault, Count };
 void NoteHotAddress(HotKind kind, uint64_t address) noexcept;
 // Large GPU-written buffer bindings (they mark the whole range GPU-owned), keyed by base address.
 void NoteWrittenRange(uint64_t address, uint64_t size) noexcept;
+// CPU->GPU image uploads (whole-image re-uploads after guest writes), keyed by base address.
+// reason bits: 1 = buffer-modified, 2 = guest-written, 4 = possibly guest-written (edge page).
+void NoteImageUpload(uint64_t address, uint64_t size, uint32_t reason) noexcept;
 
 // Starts a ~1 kHz stack sampler for the calling thread (the GPU command thread); stacks are
 // written to _gpu_profile.log every few seconds. Windows only; "gpu_profiler=0" disables it.

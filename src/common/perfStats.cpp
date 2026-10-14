@@ -208,6 +208,48 @@ void WriteWrittenRanges(FILE* file) {
 	g_written_ranges.clear();
 }
 
+struct ImageUpload {
+	uint64_t size    = 0;
+	uint32_t count   = 0;
+	uint32_t reasons = 0;
+};
+std::unordered_map<uint64_t, ImageUpload> g_image_uploads;
+
+void WriteImageUploads(FILE* file) {
+	std::lock_guard lock(g_hot_mutex);
+	if (g_image_uploads.empty()) {
+		return;
+	}
+	uint64_t total = 0;
+	for (const auto& [address, upload]: g_image_uploads) {
+		total += upload.size * upload.count;
+	}
+	std::vector<std::pair<uint64_t, ImageUpload>> sorted(g_image_uploads.begin(),
+	                                                     g_image_uploads.end());
+	const auto top = (std::min<size_t>)(sorted.size(), 8);
+	std::partial_sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(top),
+	                  sorted.end(), [](const auto& a, const auto& b) {
+		                  return a.second.size * a.second.count > b.second.size * b.second.count;
+	                  });
+	std::fprintf(file, "    hot image-upload images=%zu total=%lluKiB:", g_image_uploads.size(),
+	             static_cast<unsigned long long>(total >> 10u));
+	for (size_t i = 0; i < top; i++) {
+		std::fprintf(file, " %llx+%llx*%u/r%u", static_cast<unsigned long long>(sorted[i].first),
+		             static_cast<unsigned long long>(sorted[i].second.size),
+		             sorted[i].second.count, sorted[i].second.reasons);
+	}
+	std::fprintf(file, "\n");
+	g_image_uploads.clear();
+}
+
+void NoteImageUpload(uint64_t address, uint64_t size, uint32_t reason) noexcept {
+	std::lock_guard lock(g_hot_mutex);
+	auto& upload = g_image_uploads[address];
+	upload.size  = (std::max)(upload.size, size);
+	upload.count++;
+	upload.reasons |= reason;
+}
+
 void NoteWrittenRange(uint64_t address, uint64_t size) noexcept {
 	std::lock_guard lock(g_hot_mutex);
 	auto& range = g_written_ranges[address];
@@ -579,6 +621,7 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	             static_cast<unsigned long long>(gpu_indirect));
 	WriteHotPages(g_file);
 	WriteWrittenRanges(g_file);
+	WriteImageUploads(g_file);
 	std::fflush(g_file);
 }
 
