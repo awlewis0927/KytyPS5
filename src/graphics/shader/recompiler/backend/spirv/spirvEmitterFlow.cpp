@@ -59,11 +59,24 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
 	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
-	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
+	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId ||
+	    kind == IR::StageInputKind::BaseVertex || kind == IR::StageInputKind::BaseInstance) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		// A native-fetch indirect draw passes base vertex/instance in user SGPRs, as the CPU path
+		// did with zero Vulkan offsets; Vulkan now adds them to the indices, so take them out.
+		if (const auto* indirect = IndirectDrawInput(state);
+		    indirect != nullptr && !indirect->fetch_embedded &&
+		    (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex)) {
+			const auto base = EmitBuiltinU32(state,
+			                                 kind == IR::StageInputKind::VertexIndex
+			                                     ? IR::StageInputKind::BaseVertex
+			                                     : IR::StageInputKind::BaseInstance,
+			                                 0);
+			return EmitBinaryU32(state, spv::OpISub, bits, base);
+		}
 		return bits;
 	}
 	if (kind == IR::StageInputKind::FragCoord || kind == IR::StageInputKind::TessCoord) {
@@ -668,6 +681,18 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
+	if (const auto* indirect = IndirectDrawInput(state); indirect != nullptr) {
+		const auto index = IR::RegIndex(reg);
+		const auto base  = state.program.user_data_base;
+		if (indirect->indirect_vertex_slot >= 0 &&
+		    index == base + static_cast<uint32_t>(indirect->indirect_vertex_slot)) {
+			return EmitBuiltinU32(state, IR::StageInputKind::BaseVertex, 0);
+		}
+		if (indirect->indirect_instance_slot >= 0 &&
+		    index == base + static_cast<uint32_t>(indirect->indirect_instance_slot)) {
+			return EmitBuiltinU32(state, IR::StageInputKind::BaseInstance, 0);
+		}
+	}
 
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {

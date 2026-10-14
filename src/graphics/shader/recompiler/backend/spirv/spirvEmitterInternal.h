@@ -396,6 +396,14 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
+// Vertex input info when this vertex shader is compiled for a GPU-side indirect draw.
+inline const ShaderVertexInputInfo* IndirectDrawInput(const EmitterState& state) {
+	if (state.program.stage != ShaderType::Vertex || state.input_info.vertex == nullptr ||
+	    !state.input_info.vertex->indirect_draw) {
+		return nullptr;
+	}
+	return state.input_info.vertex;
+}
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
