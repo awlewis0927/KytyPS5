@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -450,6 +451,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+	const uint64_t checkpoint_seq = LastGpuCheckpointSeq();
 	Common::LockGuard lock(m_context.GetMutex());
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
@@ -496,6 +498,27 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
+	if (checkpoint_seq != 0 && buffer.GetGraphics().checkpoints_enabled) {
+		// Hang diagnostics: keep a GPU-side copy of the arguments this dispatch will consume.
+		static std::unique_ptr<Buffer> args_ring;
+		if (!args_ring) {
+			args_ring = std::make_unique<Buffer>(buffer.GetGraphics(),
+			                                     m_context.GetCommandScheduler(),
+			                                     MemoryUsage::Download, 0,
+			                                     vk::BufferUsageFlagBits::eTransferDst, 8192 * 16);
+			SetCheckpointArgsRing(reinterpret_cast<const uint32_t*>(args_ring->Mapped().data()),
+			                      [] { args_ring->Invalidate(0, 8192 * 16); });
+		}
+		vk::MemoryBarrier copy_barrier {};
+		copy_barrier.srcAccessMask =
+		    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		copy_barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &copy_barrier, 0,
+		                          nullptr, 0, nullptr);
+		const vk::BufferCopy copy {args_offset, (checkpoint_seq % 8192) * 16, 12};
+		vk_buffer.copyBuffer(args_buffer->Handle(), args_ring->Handle(), 1, &copy);
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

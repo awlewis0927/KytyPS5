@@ -84,7 +84,18 @@ constexpr uint64_t                             CheckpointRing = 8192;
 std::array<CheckpointRecord, CheckpointRing>   g_checkpoints {};
 std::atomic<uint64_t>                          g_checkpoint_seq {0};
 std::atomic_bool                               g_checkpoints_dumped {false};
+const uint32_t*                                g_args_ring = nullptr;
+void (*g_args_ring_invalidate)()                           = nullptr;
 } // namespace
+
+uint64_t LastGpuCheckpointSeq() {
+	return g_checkpoint_seq.load(std::memory_order_relaxed);
+}
+
+void SetCheckpointArgsRing(const uint32_t* mapped, void (*invalidate)()) {
+	g_args_ring            = mapped;
+	g_args_ring_invalidate = invalidate;
+}
 
 void RecordGpuCheckpoint(GraphicContext& /*graphics*/, vk::CommandBuffer buffer, uint32_t op,
                          uint64_t submit_id, uint32_t arg0, uint32_t arg1, uint32_t arg2,
@@ -107,7 +118,10 @@ void DumpGpuCheckpoints(GraphicContext& graphics, const char* reason) {
 	if (!graphics.checkpoints_enabled ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV == nullptr) {
 		text += "checkpoints unavailable\n";
-		PerfStats::WriteCrashReport(text.c_str(), nullptr);
+		if (FILE* file = std::fopen("_gpu_hang.log", "w"); file != nullptr) {
+			std::fputs(text.c_str(), file);
+			std::fclose(file);
+		}
 		return;
 	}
 	uint32_t count = 0;
@@ -119,6 +133,9 @@ void DumpGpuCheckpoints(GraphicContext& graphics, const char* reason) {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(graphics.queue, &count, data.data());
 	const auto last = g_checkpoint_seq.load();
+	if (g_args_ring_invalidate != nullptr) {
+		g_args_ring_invalidate();
+	}
 	char       line[256];
 	std::snprintf(line, sizeof(line), "last recorded seq=%llu; GPU-reached markers=%u\n",
 	              static_cast<unsigned long long>(last), count);
@@ -141,13 +158,22 @@ void DumpGpuCheckpoints(GraphicContext& graphics, const char* reason) {
 		if (rec.seq != seq) {
 			continue;
 		}
-		std::snprintf(line, sizeof(line), "  %llu op=%u sub=%llu %x %u %u %u %llx\n",
+		std::snprintf(line, sizeof(line), "  %llu op=%u sub=%llu %x %u %u %u %llx",
 		              static_cast<unsigned long long>(rec.seq), rec.op,
 		              static_cast<unsigned long long>(rec.submit_id), rec.arg0, rec.arg1, rec.arg2,
 		              rec.arg3, static_cast<unsigned long long>(rec.arg4));
 		text += line;
+		if (rec.op == 9 && g_args_ring != nullptr) {
+			const auto* args = g_args_ring + (seq % CheckpointRing) * 4;
+			std::snprintf(line, sizeof(line), " groups=%u,%u,%u", args[0], args[1], args[2]);
+			text += line;
+		}
+		text += "\n";
 	}
-	PerfStats::WriteCrashReport(text.c_str(), nullptr);
+	if (FILE* file = std::fopen("_gpu_hang.log", "w"); file != nullptr) {
+		std::fputs(text.c_str(), file);
+		std::fclose(file);
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
