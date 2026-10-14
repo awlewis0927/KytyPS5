@@ -391,6 +391,14 @@ void DumpSamplerProfile() noexcept {
 
 } // namespace
 
+namespace {
+std::atomic_bool g_checkpoints_armed {false};
+} // namespace
+
+bool CheckpointsArmed() noexcept {
+	return g_checkpoints_armed.load(std::memory_order_relaxed);
+}
+
 void StartThreadSampler() noexcept {
 #if defined(_WIN32)
 	if (!TweakEnabled("gpu_profiler", true) || g_sampler_started.exchange(true)) {
@@ -474,6 +482,11 @@ void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept {
 	const auto frames = presented_frames - g_last_frames;
 	g_last_frames     = presented_frames;
 	const auto fps    = static_cast<double>(frames) * 1000.0 / static_cast<double>(elapsed_ms);
+	static uint32_t low_fps_seconds = 0;
+	low_fps_seconds = (g_total_ms > 60000 && fps < 4.0) ? low_fps_seconds + 1 : 0;
+	if (low_fps_seconds >= 3) {
+		g_checkpoints_armed.store(true, std::memory_order_relaxed);
+	}
 
 	const auto readback      = TakeMs(Timer::GuestReadback);
 	const auto download      = TakeMs(Timer::DownloadWait);

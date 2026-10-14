@@ -83,6 +83,10 @@ void StartThreadSampler() noexcept;
 // _crash.log. Windows stacks only.
 void WriteCrashReport(const char* text, void* native_context) noexcept;
 
+// GPU checkpoint markers slow the GPU enough to change the game's loading behavior, so they are
+// armed only once the game drops below 4 fps after the first minute (the heavy first level).
+bool CheckpointsArmed() noexcept;
+
 // Called by the window thread about once per second with the presented frame total.
 void Report(uint64_t presented_frames, uint64_t elapsed_ms) noexcept;
 
