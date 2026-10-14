@@ -134,7 +134,9 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// would force a full GPU drain per draw. Once a table read has returned identical words four
 	// times in a row, serve it from the last published copy, re-verifying every 16th read.
 	static const bool stable_srt = PerfStats::TweakEnabled("stable_srt_reads", false);
-	if (!stable_srt || !GuestGpu::IsGpuThread()) {
+	// Armed only in the heavy level (after 3 s below 4 fps): during loading, stale tables kept
+	// the game from ever leaving the loading screen.
+	if (!stable_srt || !GuestGpu::IsGpuThread() || !PerfStats::CheckpointsArmed()) {
 		return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
 		                                                     values.size_bytes());
 	}
