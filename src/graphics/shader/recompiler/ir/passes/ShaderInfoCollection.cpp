@@ -184,8 +184,10 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::GlobalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 			break;
+		case StageInputKind::DrawIndex: AddInput(info, kind, 0, 1, "gl_DrawID"); break;
 		case StageInputKind::PackedAncillary:
 		case StageInputKind::Parameter: break;
+		default: break;
 	}
 }
 
@@ -271,7 +273,7 @@ struct InputUsage {
 	std::array<uint8_t, 32> components {};
 	std::array<bool, 32> per_vertex {};
 	std::array<bool, NumScalarRegs> user_data {};
-	std::array<StageInputKind, static_cast<size_t>(StageInputKind::Parameter)> builtins {};
+	std::array<StageInputKind, static_cast<size_t>(StageInputKind::DrawIndex) + 1> builtins {};
 	uint32_t builtin_mask = 0;
 	uint32_t builtin_count = 0;
 
@@ -436,6 +438,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				case StageInputKind::InstanceIndex:
 				case StageInputKind::FrontFacing:
 				case StageInputKind::LocalInvocationIndex:
+				case StageInputKind::DrawIndex:
 					if (component != 0u) {
 						return Fail("typed scalar builtin component is out of range");
 					}
