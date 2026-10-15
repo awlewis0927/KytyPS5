@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -106,6 +107,15 @@ public:
 	static void AdvanceStickyEpoch() noexcept {
 		s_sticky_epoch.fetch_add(1, std::memory_order_relaxed);
 	}
+	[[nodiscard]] static uint64_t StickyEpoch() noexcept {
+		return s_sticky_epoch.load(std::memory_order_relaxed);
+	}
+	// Base addresses of every region that has held a sticky page. Sticky pages stop faulting,
+	// so callers that only follow the CPU-write log must also revisit these regions.
+	static void CopyStickyRegions(std::vector<uint64_t>& out) {
+		std::lock_guard lock(s_sticky_regions_mutex);
+		out.assign(s_sticky_regions.begin(), s_sticky_regions.end());
+	}
 	// Called (under the lock) after a guest write fault made the range CPU-dirty.
 	void NoteCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (!s_sticky_enabled) {
@@ -119,6 +129,11 @@ public:
 			}
 			if (faults >= StickyFaults) {
 				m_sticky.Set(page);
+				if (!m_sticky_listed) {
+					m_sticky_listed = true;
+					std::lock_guard lock(s_sticky_regions_mutex);
+					s_sticky_regions.push_back(m_cpu_addr);
+				}
 			}
 		}
 	}
@@ -253,6 +268,8 @@ private:
 	static constexpr uint8_t StickyFaults = 4;
 	inline static bool                  s_sticky_enabled = false;
 	inline static std::atomic<uint64_t> s_sticky_epoch {1};
+	inline static std::mutex            s_sticky_regions_mutex;
+	inline static std::vector<uint64_t> s_sticky_regions;
 
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
@@ -263,6 +280,7 @@ private:
 	RegionBits   m_sticky;
 	RegionBits   m_sticky_uploaded;
 	uint64_t     m_sticky_epoch = 0;
+	bool         m_sticky_listed = false;
 	std::array<uint8_t, TRACKER_REGION_PAGES> m_write_faults {};
 };
 
