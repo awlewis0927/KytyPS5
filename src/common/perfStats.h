@@ -56,6 +56,7 @@ enum class Counter : uint32_t {
 	RelaxedFaults,     // guest faults on shared GPU/CPU pages served without a stall
 	StableSkips,       // guest faults on GPU-unchanged pages served without a readback
 	GpuIndirectDraws,  // indirect draw packets consumed by the GPU without a CPU readback
+	SrtMemoHits,       // shader resource tables reused because their inputs were unchanged
 	Count
 };
 
