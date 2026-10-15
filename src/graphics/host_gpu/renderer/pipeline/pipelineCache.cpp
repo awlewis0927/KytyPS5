@@ -140,6 +140,51 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 		return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
 		                                                     values.size_bytes());
 	}
+	// "srt_fast": the walker reads single DWORDs, so a hashed map of heap vectors cost more than
+	// the read itself. Small reads use a fixed direct-mapped table instead; a slot taken over by
+	// another address restarts its streak, so a stale value is never served.
+	static const bool fast_table = PerfStats::TweakEnabled("srt_fast", false);
+	if (fast_table && values.size() <= 4) {
+		struct FastRead {
+			uint64_t                key    = 0;
+			std::array<uint32_t, 4> last   {};
+			uint32_t                streak = 0;
+			uint32_t                uses   = 0;
+		};
+		static std::vector<FastRead> table(1u << 16); // GPU thread only
+		const uint64_t key  = address ^ (static_cast<uint64_t>(values.size()) << 48u);
+		auto&          slot = table[((key >> 2u) * 0x9E3779B97F4A7C15ull) >> 48u];
+		if (slot.key != key) {
+			slot.key    = key;
+			slot.streak = 0;
+			slot.uses   = 0;
+			slot.last.fill(0u);
+			if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+			                                                   values.size_bytes())) {
+				slot.key = 0;
+				return false;
+			}
+			std::copy(values.begin(), values.end(), slot.last.begin());
+			return true;
+		}
+		if (slot.streak >= 4 && (++slot.uses % 16) != 0 &&
+		    Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+			PerfStats::Add(PerfStats::Counter::StableSkips);
+			return true;
+		}
+		if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+		                                                   values.size_bytes())) {
+			return false;
+		}
+		if (std::equal(values.begin(), values.end(), slot.last.begin())) {
+			slot.streak = std::min<uint32_t>(slot.streak + 1, 1000);
+		} else {
+			std::copy(values.begin(), values.end(), slot.last.begin());
+			slot.streak = 0;
+			slot.uses   = 0;
+		}
+		return true;
+	}
 	struct StableRead {
 		std::vector<uint32_t> last;
 		uint32_t              streak = 0;
