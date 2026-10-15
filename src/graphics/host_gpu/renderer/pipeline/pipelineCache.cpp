@@ -784,7 +784,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
-		if (m_pending_indirect) {
+		static const bool gpu_indirect_mesh = PerfStats::TweakEnabled("gpu_indirect_mesh", false);
+		if (m_pending_indirect &&
+		    (vertex_info[0].logical_stage != ShaderType::Mesh || gpu_indirect_mesh)) {
 			vertex_info[0].indirect_draw          = true;
 			vertex_info[0].indirect_vertex_slot   = m_pending_indirect_vertex;
 			vertex_info[0].indirect_instance_slot = m_pending_indirect_instance;
