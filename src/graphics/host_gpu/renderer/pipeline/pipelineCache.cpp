@@ -507,6 +507,12 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		static const bool srt_merge = [] {
+			const bool enabled = PerfStats::TweakEnabled("srt_fast", false);
+			ShaderRecompiler::IR::SetSrtRangeMerge(enabled);
+			return enabled;
+		}();
+		(void)srt_merge;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
