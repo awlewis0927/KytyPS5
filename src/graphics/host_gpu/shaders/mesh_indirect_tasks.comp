@@ -1,0 +1,54 @@
+#version 450
+
+// Converts guest indexed indirect draw arguments into mesh-task indirect commands.
+//
+// Guest mesh (NGG) draws take their size from an argument array the GPU wrote earlier. The CPU
+// path read that array back, which drains the whole GPU queue. This dispatch instead derives each
+// draw's mesh workgroup count on the GPU, so vkCmdDrawMeshTasksIndirect[Count]EXT can consume it;
+// the mesh shader itself reads the remaining per-draw fields (first index, base vertex, first
+// instance) from the same guest records through gl_DrawID.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ArgsBuffer {
+    uint args[];
+};
+
+layout(std430, binding = 1) writeonly buffer TaskBuffer {
+    uint tasks[];
+};
+
+layout(push_constant) uniform Params {
+    uint args_offset_words; // dword index of draw 0 inside args[]
+    uint stride_words;      // dwords between consecutive guest records
+    uint max_count;         // records to convert
+    uint task_offset_words; // dword index of draw 0's command inside tasks[]
+    uint prim_size;         // vertices of the first primitive
+    uint prim_step;         // vertices per additional primitive
+    uint prims_per_group;   // primitives per mesh workgroup
+    uint max_groups_x;      // host maxMeshWorkGroupCount[0]
+    uint max_groups_y;      // host maxMeshWorkGroupCount[1]
+} params;
+
+void main() {
+    const uint draw = gl_GlobalInvocationID.x;
+    if (draw >= params.max_count) {
+        return;
+    }
+    const uint record    = params.args_offset_words + draw * params.stride_words;
+    const uint count     = args[record];
+    const uint instances = args[record + 1u];
+    const uint prims =
+        count < params.prim_size ? 0u : (count - params.prim_size) / params.prim_step + 1u;
+    uint groups = prims == 0u ? 0u : (prims - 1u) / params.prims_per_group + 1u;
+    uint inst   = instances;
+    if (groups == 0u || inst == 0u || groups > params.max_groups_x ||
+        inst > params.max_groups_y) {
+        groups = 0u;
+        inst   = 0u;
+    }
+    const uint out_index = params.task_offset_words + draw * 3u;
+    tasks[out_index]      = groups;
+    tasks[out_index + 1u] = inst;
+    tasks[out_index + 2u] = groups == 0u ? 0u : 1u;
+}
