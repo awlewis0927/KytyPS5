@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/perfStats.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -39,12 +40,29 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	return runtime;
 }
 
+// "srt_fast": the walker reads one DWORD at a time, so a table walk records hundreds of
+// adjacent 4-byte ranges that every draw then tests against every written range. Adjacent or
+// repeated reads are merged into the previous range; overlap tests see the same union.
+static void RecordRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t address,
+                        uint64_t size) {
+	static const bool merge = PerfStats::TweakEnabled("srt_fast", false);
+	if (merge && !ranges.empty() && size != 0) {
+		auto& last = ranges.back();
+		const auto last_end = last.first + last.second;
+		if (last.second != 0 && address >= last.first && address <= last_end) {
+			last.second = std::max(last_end, address + size) - last.first;
+			return;
+		}
+	}
+	ranges.emplace_back(address, size);
+}
+
 bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
 		return false;
 	}
-	capture.m_ranges.emplace_back(address, values.size_bytes());
+	RecordRange(capture.m_ranges, address, values.size_bytes());
 	return true;
 }
 
@@ -59,7 +77,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 		}
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
-	capture.m_ranges.emplace_back(address, values.size_bytes());
+	RecordRange(capture.m_ranges, address, values.size_bytes());
 	return true;
 }
 
