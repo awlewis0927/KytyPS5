@@ -583,7 +583,43 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
+	if (m_log_changes && m_new_buffers.size() < 4096) {
+		m_new_buffers.push_back(id);
+	}
 	return id;
+}
+
+bool BufferCache::SynchronizeLoggedChanges() {
+	if (!m_log_changes) {
+		m_log_changes = true;
+		m_memory_tracker.EnableDirtyLog();
+		return false; // the first call synchronizes everything; logging starts from here
+	}
+	static thread_local std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	ranges.clear();
+	const bool complete = m_memory_tracker.DrainDirtyLog(ranges) && m_new_buffers.size() < 4096;
+	auto       created  = std::move(m_new_buffers);
+	m_new_buffers.clear();
+	if (!complete) {
+		return false;
+	}
+	for (const auto& [address, size]: ranges) {
+		SynchronizeBuffersInRange(address, size);
+	}
+	for (const auto id: created) {
+		if (!IsBufferInvalid(id)) {
+			auto& buffer = m_slot_buffers[id];
+			(void)SynchronizeBuffer(buffer, buffer.CpuAddress(), buffer.Size(), false, false);
+		}
+	}
+	return true;
+}
+
+void BufferCache::DiscardLoggedChanges() {
+	static thread_local std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	ranges.clear();
+	(void)m_memory_tracker.DrainDirtyLog(ranges);
+	m_new_buffers.clear();
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
