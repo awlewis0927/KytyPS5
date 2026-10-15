@@ -300,9 +300,63 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
+		// "srt_memo": the resource tables of a draw are a pure function of its user data, shader
+		// base, workgroup counts and the guest memory the walk read (all recorded in
+		// specialization_reads). When those are byte-identical to the previous walk of this
+		// shader, its snapshot and permutation are reused instead of re-walking the tables.
+		struct SrtMemo {
+			bool                    valid  = false;
+			uint32_t                cursor = 0;
+			uint64_t                shader_base = 0;
+			uint64_t                hash        = 0;
+			std::array<uint32_t, 3> workgroups {};
+			std::vector<uint32_t>   user_data;
+			Permutation*            result = nullptr;
+		};
+
+		static bool FingerprintReads(const std::vector<std::pair<uint64_t, uint64_t>>& reads,
+		                             uint64_t& hash) {
+			static thread_local std::vector<uint8_t> bytes;
+			hash = reads.size();
+			for (const auto& [address, size]: reads) {
+				if (size == 0) {
+					continue;
+				}
+				// GPU-written tables must go through the normal (readback-aware) walk.
+				if (size > 64u * 1024u || Libs::LibKernel::Memory::HasGpuDirtyBytes(address, size)) {
+					return false;
+				}
+				bytes.resize(size);
+				if (!Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+					return false;
+				}
+				hash = XXH3_64bits_withSeed(bytes.data(), size, hash ^ address);
+			}
+			return true;
+		}
+
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
+			static const bool memo_enabled = PerfStats::TweakEnabled("srt_memo", false);
+			// Only walks whose every memory read is captured can be fingerprinted.
+			const bool memo_ok = memo_enabled && !HasCalls &&
+			                     (resource_plan.capture_specialization_reads ||
+			                      !resource_plan.source_reads.empty());
+			std::array<uint32_t, 3> workgroups {};
+			for (size_t i = 0; i < std::min<size_t>(3, runtime.workgroup_counts.size()); i++) {
+				workgroups[i] = runtime.workgroup_counts[i];
+			}
+			if (memo_ok && memo.valid && memo.cursor == push_data_cursor &&
+			    memo.shader_base == runtime.shader_base && memo.workgroups == workgroups &&
+			    std::ranges::equal(memo.user_data, runtime.user_data)) {
+				uint64_t hash = 0;
+				if (FingerprintReads(resources.specialization_reads, hash) && hash == memo.hash) {
+					PerfStats::Add(PerfStats::Counter::SrtMemoHits);
+					return memo.result;
+				}
+			}
+			memo.valid = false;
 			{
 				PerfStats::ScopedTimer srt_timer(PerfStats::Timer::SrtMaterialize);
 				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -318,6 +372,14 @@ struct PipelineCache::ProgramCache {
 				if constexpr (HasCalls) {
 					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
 				}
+				if (memo_ok && FingerprintReads(resources.specialization_reads, memo.hash)) {
+					memo.valid       = true;
+					memo.cursor      = push_data_cursor;
+					memo.shader_base = runtime.shader_base;
+					memo.workgroups  = workgroups;
+					memo.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+					memo.result      = &candidate;
+				}
 				return &candidate;
 			}
 			return nullptr;
@@ -328,6 +390,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		SrtMemo                                     memo;
 	};
 
 	struct ProgramKeyHash {
@@ -489,12 +552,14 @@ struct PipelineCache::ProgramCache {
 			    entry->second.specialization));
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			entry->second.memo.valid    = false;
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
 		}
+		entry->second.memo.valid = false; // push_back may move the remembered permutation
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
