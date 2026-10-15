@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1138,7 +1139,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		// GPU-side indirect mesh draws size each draw on the GPU (see MeshIndirectConverter);
+		// index_count then spans the whole index buffer and only bounds the host limits check.
+		mesh_groups        = emit.args_addr != 0 ? 1u : (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
 		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
@@ -1155,6 +1158,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		(void)m_context.GetBufferCache().FindBuffer(
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
+	}
+	if (mesh_active && emit.args_addr != 0) {
+		// GPU-side indirect mesh draws also read their argument records through BDA.
+		(void)m_context.GetBufferCache().FindBuffer(
+		    emit.args_addr, static_cast<uint64_t>(emit.stride) * emit.max_count);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	std::optional<PerfStats::ScopedTimer> bindings_timer(std::in_place,
@@ -1238,6 +1246,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
+	MeshIndirectConverter::Tasks mesh_tasks {};
+	if (mesh_active && emit.args_buffer != nullptr) {
+		// Size every draw on the GPU before any graphics state of this draw is recorded; the
+		// conversion is a compute dispatch, so it has to run outside rendering.
+		m_context.GetCommandScheduler().EndRendering();
+		static auto* converter = new MeshIndirectConverter(
+		    m_context.GetGraphics(), m_context.GetCommandScheduler()); // lives until exit
+		const auto& mesh = state.vertex_info[0].mesh;
+		mesh_tasks       = converter->Record(
+		          vk_buffer, {.args_buffer     = emit.args_buffer,
+		                      .args_offset     = emit.args_offset,
+		                      .stride          = emit.stride,
+		                      .max_count       = emit.max_count,
+		                      .prim_size       = mesh.InputPrimitiveSize(),
+		                      .prim_step       = mesh.InputPrimitiveStep(),
+		                      .prims_per_group = mesh.primitives_per_group});
+		EXIT_IF(mesh_tasks.buffer == nullptr);
+	}
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1246,7 +1272,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (mesh_active) {
+	if (mesh_active && emit.args_addr != 0) {
+		// Indirect layout (see the mesh entry in Translate.cpp): stride, index bytes, index
+		// buffer base, guest argument array.
+		const uint32_t draw_data[] {
+		    emit.stride, index_source.guest_element_size,
+		    static_cast<uint32_t>(index_source.address),
+		    static_cast<uint32_t>(index_source.address >> 32u),
+		    static_cast<uint32_t>(emit.args_addr), static_cast<uint32_t>(emit.args_addr >> 32u)};
+		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		vk_buffer.pushConstants(pipeline.pipeline_layout,
+		                        vk::ShaderStageFlagBits::eMeshEXT |
+		                            vk::ShaderStageFlagBits::eFragment,
+		                        0, sizeof(draw_data), draw_data);
+	} else if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
@@ -1288,7 +1327,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	if (mesh_active && mesh_tasks.buffer != nullptr) {
+		if (emit.count_buffer != nullptr) {
+			vk_buffer.drawMeshTasksIndirectCountEXT(mesh_tasks.buffer, mesh_tasks.offset,
+			                                        emit.count_buffer, emit.count_offset,
+			                                        emit.max_count,
+			                                        MeshIndirectConverter::TaskStride);
+		} else {
+			vk_buffer.drawMeshTasksIndirectEXT(mesh_tasks.buffer, mesh_tasks.offset,
+			                                   emit.max_count, MeshIndirectConverter::TaskStride);
+		}
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
@@ -1444,8 +1493,14 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return true;
 	}
-	if (gpu_indirect && (state.programs.VertexStageCount() != 1 ||
-	                     state.vertex_info[0].logical_stage != ShaderType::Vertex ||
+	// "gpu_indirect_mesh": mesh (NGG) pipelines read their per-draw records through gl_DrawID.
+	static const bool gpu_indirect_mesh = PerfStats::TweakEnabled("gpu_indirect_mesh", false);
+	const bool        indirect_stage_ok =
+	    state.vertex_info[0].logical_stage == ShaderType::Vertex ||
+	    (gpu_indirect_mesh && state.vertex_info[0].logical_stage == ShaderType::Mesh &&
+	     !state.vertex_info[0].mesh.fast_launch && state.vertex_info[0].mesh.primitives_per_group != 0 &&
+	     m_context.GetGraphics().mesh_shader_enabled);
+	if (gpu_indirect && (state.programs.VertexStageCount() != 1 || !indirect_stage_ok ||
 	                     !state.vertex_info[0].indirect_draw)) {
 		// Mesh or tessellation pipelines take their draw sizes from the CPU.
 		PerfStats::NoteIndirectFallback(

@@ -37,7 +37,7 @@ namespace GpuTiming {
 namespace {
 
 constexpr uint32_t ChunkSize  = 4096;
-constexpr uint32_t ChunkCount = 16;
+constexpr uint32_t ChunkCount = 64;
 constexpr uint32_t BeginKind  = 0xF0u;
 constexpr uint32_t EndKind    = 0xFFu;
 
@@ -47,10 +47,14 @@ struct Tag {
 };
 
 struct Chunk {
-	bool             busy = false;
-	uint32_t         used = 0;
+	bool             busy      = false;
+	bool             submitted = false;
+	uint32_t         used      = 0;
+	uint32_t         polls     = 0;
 	std::vector<Tag> tags;
 };
+
+bool Harvest(int32_t index);
 
 vk::Device                       g_device;
 vk::QueryPool                    g_pool;
@@ -83,6 +87,14 @@ void Begin(GraphicContext& graphics, vk::CommandBuffer buffer) {
 			chunk.tags.resize(ChunkSize);
 		}
 	}
+	// Collect finished command buffers (non-blocking); a chunk that never completes is dropped.
+	for (uint32_t i = 0; i < ChunkCount; i++) {
+		auto& chunk = g_chunks[i];
+		if (chunk.busy && chunk.submitted && !Harvest(static_cast<int32_t>(i)) &&
+		    ++chunk.polls > 4096) {
+			chunk.busy = false;
+		}
+	}
 	for (uint32_t i = 0; i < ChunkCount; i++) {
 		if (!g_chunks[i].busy) {
 			g_current = static_cast<int32_t>(i);
@@ -92,9 +104,11 @@ void Begin(GraphicContext& graphics, vk::CommandBuffer buffer) {
 	if (g_current < 0) {
 		return;
 	}
-	auto& chunk = g_chunks[g_current];
-	chunk.busy  = true;
-	chunk.used  = 0;
+	auto& chunk     = g_chunks[g_current];
+	chunk.busy      = true;
+	chunk.submitted = false;
+	chunk.used      = 0;
+	chunk.polls     = 0;
 	g_buffer    = buffer;
 	buffer.resetQueryPool(g_pool, static_cast<uint32_t>(g_current) * ChunkSize, ChunkSize);
 	Stamp(buffer, BeginKind, 0);
@@ -107,10 +121,11 @@ int32_t End(vk::CommandBuffer buffer) {
 	Stamp(buffer, EndKind, 0);
 	const auto chunk = g_current;
 	g_current        = -1;
+	g_chunks[chunk].submitted = true;
 	return chunk;
 }
 
-void Harvest(int32_t index) {
+bool Harvest(int32_t index) {
 	auto& chunk = g_chunks[index];
 	if (chunk.used >= 2) {
 		std::vector<uint64_t> values(chunk.used);
@@ -118,6 +133,9 @@ void Harvest(int32_t index) {
 		    g_pool, static_cast<uint32_t>(index) * ChunkSize, chunk.used,
 		    values.size() * sizeof(uint64_t), values.data(), sizeof(uint64_t),
 		    vk::QueryResultFlagBits::e64);
+		if (result == vk::Result::eNotReady) {
+			return false;
+		}
 		if (result == vk::Result::eSuccess) {
 			const auto to_ns = [](uint64_t ticks) {
 				return static_cast<uint64_t>(static_cast<double>(ticks) * g_period_ns);
@@ -132,6 +150,7 @@ void Harvest(int32_t index) {
 		}
 	}
 	chunk.busy = false;
+	return true;
 }
 
 } // namespace
@@ -469,13 +488,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
-	if (const auto chunk = GpuTiming::End(m_command.m_buffer); chunk >= 0) {
-		if (Active()) {
-			DeferOperation([chunk] { GpuTiming::Harvest(chunk); });
-		} else {
-			GpuTiming::Harvest(chunk); // not submitted yet: frees the chunk without results
-		}
-	}
+	(void)GpuTiming::End(m_command.m_buffer); // collected by a later Begin once complete
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
