@@ -214,6 +214,7 @@ enum class StageInputKind {
 	Parameter,
 	BaseVertex,   // gl_BaseVertex (GPU-side indirect draws)
 	BaseInstance, // gl_BaseInstance (GPU-side indirect draws)
+	DrawIndex,    // gl_DrawID (GPU-side indirect mesh draws)
 };
 
 enum class StageOutputKind {
