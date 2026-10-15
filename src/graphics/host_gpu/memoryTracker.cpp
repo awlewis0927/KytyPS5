@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/perfStats.h"
 
 namespace Libs::Graphics {
 
@@ -9,6 +10,9 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	if (PerfStats::TweakEnabled("sticky_pages", false)) {
+		RegionManager::EnableStickyPages();
+	}
 }
 
 MemoryTracker::~MemoryTracker() = default;

@@ -69,6 +69,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				manager->NoteCpuWrite(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
 			LogCpuDirty(manager->GetCpuAddr() + offset, bytes);

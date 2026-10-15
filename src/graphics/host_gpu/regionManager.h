@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -98,9 +99,50 @@ public:
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
+	// "sticky_pages": pages the guest keeps rewriting stop being write-protected. They stay
+	// CPU-dirty permanently and are uploaded at most once per host submission (epoch), which
+	// replaces a write fault plus a re-protect syscall per page per use.
+	static void EnableStickyPages() noexcept { s_sticky_enabled = true; }
+	static void AdvanceStickyEpoch() noexcept {
+		s_sticky_epoch.fetch_add(1, std::memory_order_relaxed);
+	}
+	// Called (under the lock) after a guest write fault made the range CPU-dirty.
+	void NoteCpuWrite(uint64_t vaddr, uint64_t size) {
+		if (!s_sticky_enabled) {
+			return;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		for (size_t page = start; page < end; page++) {
+			auto& faults = m_write_faults[page];
+			if (faults < 255) {
+				faults++;
+			}
+			if (faults >= StickyFaults) {
+				m_sticky.Set(page);
+			}
+		}
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
+		if constexpr (source == DirtySource::Gpu && enable) {
+			if (s_sticky_enabled) {
+				// GPU-owned data replaces the guest's copy: these pages leave sticky mode.
+				const RegionBits sticky(m_sticky, start, end);
+				if (sticky.Any()) {
+					m_cpu_dirty &= ~sticky;
+					m_sticky &= ~sticky;
+					m_sticky_uploaded &= ~sticky;
+					for (size_t page = start; page < end; page++) {
+						if (sticky.Get(page)) {
+							m_write_faults[page] = 0;
+						}
+					}
+					UpdateProtection<true, false>();
+				}
+			}
+		}
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
@@ -132,6 +174,26 @@ public:
 			return;
 		}
 		RegionBits mask(bits, start, end);
+		if constexpr (clear && source == DirtySource::Cpu) {
+			if (s_sticky_enabled && m_sticky.Any()) {
+				const auto epoch = s_sticky_epoch.load(std::memory_order_relaxed);
+				if (m_sticky_epoch != epoch) {
+					m_sticky_epoch = epoch;
+					m_sticky_uploaded.Clear();
+				}
+				// Sticky pages already uploaded this epoch are skipped; all sticky pages stay
+				// CPU-dirty (and therefore writable).
+				mask &= ~(m_sticky & m_sticky_uploaded);
+				bits.UnsetRange(start, end);
+				bits |= m_sticky;
+				m_sticky_uploaded |= mask & m_sticky;
+				UpdateProtection<true, false>();
+				for (const auto [first, last]: mask) {
+					func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+				}
+				return;
+			}
+		}
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
@@ -188,12 +250,20 @@ private:
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
 
+	static constexpr uint8_t StickyFaults = 4;
+	inline static bool                  s_sticky_enabled = false;
+	inline static std::atomic<uint64_t> s_sticky_epoch {1};
+
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	RegionBits   m_sticky;
+	RegionBits   m_sticky_uploaded;
+	uint64_t     m_sticky_epoch = 0;
+	std::array<uint8_t, TRACKER_REGION_PAGES> m_write_faults {};
 };
 
 } // namespace Libs::Graphics
