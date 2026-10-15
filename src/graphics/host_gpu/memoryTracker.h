@@ -30,6 +30,30 @@ public:
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
+	// "bda_dirty_only": every range that becomes CPU-dirty is also logged, so per-draw BDA
+	// preparation can synchronize only buffers touched since the previous preparation.
+	void EnableDirtyLog() noexcept { m_dirty_log_enabled = true; }
+	// Moves the logged ranges into out; returns false when the log overflowed (full sync).
+	bool DrainDirtyLog(std::vector<std::pair<uint64_t, uint64_t>>& out) {
+		std::lock_guard lock(m_dirty_log_mutex);
+		const bool complete = !m_dirty_log_overflow;
+		out.swap(m_dirty_log);
+		m_dirty_log.clear();
+		m_dirty_log_overflow = false;
+		return complete;
+	}
+	void LogCpuDirty(uint64_t vaddr, uint64_t size) {
+		if (!m_dirty_log_enabled) {
+			return;
+		}
+		std::lock_guard lock(m_dirty_log_mutex);
+		if (m_dirty_log.size() >= (1u << 16)) {
+			m_dirty_log_overflow = true;
+			return;
+		}
+		m_dirty_log.emplace_back(vaddr, size);
+	}
+
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
@@ -47,6 +71,7 @@ public:
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
+			LogCpuDirty(manager->GetCpuAddr() + offset, bytes);
 			if (should_flush) {
 				on_flush();
 			}
@@ -150,6 +175,10 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	bool                                           m_dirty_log_enabled  = false;
+	bool                                           m_dirty_log_overflow = false;
+	std::mutex                                     m_dirty_log_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>     m_dirty_log;
 };
 
 } // namespace Libs::Graphics
