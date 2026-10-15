@@ -134,6 +134,18 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	// "bda_dirty_only": synchronizing every buffer in all mapped memory for each draw that uses
+	// shader memory access cost ~10% of the GPU thread; only buffers touched since the previous
+	// call can hold new CPU data. A full pass still runs periodically as a safety net.
+	static const bool dirty_only = PerfStats::TweakEnabled("bda_dirty_only", false);
+	static uint32_t   calls      = 0;
+	if (dirty_only && (++calls % 512) != 0 && m_buffer_cache.SynchronizeLoggedChanges()) {
+		m_fault_process_pending = true;
+		return;
+	}
+	if (dirty_only) {
+		m_buffer_cache.DiscardLoggedChanges();
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
