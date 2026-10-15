@@ -606,6 +606,20 @@ bool BufferCache::SynchronizeLoggedChanges() {
 	for (const auto& [address, size]: ranges) {
 		SynchronizeBuffersInRange(address, size);
 	}
+	// Sticky pages are writable without faulting, so the log misses their writes. Visit each
+	// region holding them once per sticky epoch, matching the full pass (which also uploads a
+	// sticky page at most once per epoch).
+	static thread_local std::vector<uint64_t>                sticky_regions;
+	static thread_local std::unordered_map<uint64_t, uint64_t> sticky_synced;
+	RegionManager::CopyStickyRegions(sticky_regions);
+	const auto epoch = RegionManager::StickyEpoch();
+	for (const auto base: sticky_regions) {
+		auto& synced = sticky_synced[base];
+		if (synced != epoch) {
+			synced = epoch;
+			SynchronizeBuffersInRange(base, TRACKER_REGION_SIZE);
+		}
+	}
 	for (const auto id: created) {
 		if (!IsBufferInvalid(id)) {
 			auto& buffer = m_slot_buffers[id];
