@@ -1205,9 +1205,56 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                     mesh.primitives_per_group > 0x1ffu ||
 			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
-			const auto draw = [&](uint32_t index) {
+			const auto push = [&](uint32_t index) {
 				return IR::U32(
 				    entry_ir.Emit(IR::ValueOpcode::MeshDrawParameter, {IR::Value(index)}));
+			};
+			// GPU-side indirect mesh draws: the push data describes the guest argument array
+			// (d0 stride, d1 index bytes, d2/d3 index buffer base, d4/d5 argument array) and
+			// each draw (gl_DrawID) reads its own {count, instances, first index, base vertex,
+			// first instance} record from guest memory.
+			const bool gpu_indirect = options.input_info.vertex->indirect_draw && !mesh.fast_launch;
+			std::array<IR::U32, 6> indirect_params {};
+			IR::U32                indirect_first_index {};
+			if (gpu_indirect) {
+				const auto record = entry_ir.IMul(builtin(IR::StageInputKind::DrawIndex), push(0));
+				const auto args_resource = entry_ir.Emit(
+				    IR::ValueOpcode::GetAddressResource,
+				    {entry_ir.BitwiseAnd(push(4), u32(~3u)), push(5)});
+				const auto args_lead = entry_ir.BitwiseAnd(push(4), u32(3u));
+				const auto field = [&](uint32_t dword) {
+					const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
+					result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+					return IR::U32(entry_ir.Emit(
+					    IR::ValueOpcode::LoadAddressU32,
+					    {args_resource, entry_ir.IAdd(entry_ir.IAdd(record, args_lead), u32(dword * 4u)),
+					     u32(0), IR::U1(IR::Value(true))},
+					    IR::MemoryFlags {.index = memory_index}));
+				};
+				const auto count          = field(0);
+				indirect_first_index      = field(2);
+				const auto base_vertex    = field(3);
+				const auto first_instance = field(4);
+				// Mirrors the CPU path: native fetches read the bases from the user-data slots
+				// instead of the vertex/instance indices.
+				const bool embedded = options.input_info.vertex->fetch_embedded;
+				indirect_params     = {count, embedded ? base_vertex : u32(0),
+				                       embedded ? first_instance : u32(0), push(1), push(2), push(3)};
+				const auto vertex_slot   = options.input_info.vertex->indirect_vertex_slot;
+				const auto instance_slot = options.input_info.vertex->indirect_instance_slot;
+				if (vertex_slot >= 0) {
+					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(options.user_data_base +
+					                                                 static_cast<uint32_t>(vertex_slot)),
+					                      base_vertex);
+				}
+				if (instance_slot >= 0) {
+					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(options.user_data_base +
+					                                                 static_cast<uint32_t>(instance_slot)),
+					                      first_instance);
+				}
+			}
+			const auto draw = [&](uint32_t index) {
+				return gpu_indirect ? indirect_params[index] : push(index);
 			};
 			const auto minimum = [&](IR::U32 lhs, IR::U32 rhs) {
 				return IR::U32(entry_ir.Emit(IR::ValueOpcode::UMin32, {lhs, rhs}));
@@ -1283,8 +1330,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
 				const auto index_low    = draw(4);
+				const auto index_vertex =
+				    gpu_indirect ? entry_ir.IAdd(input_vertex, indirect_first_index) : input_vertex;
 				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
-				                                           entry_ir.IMul(input_vertex, index_bytes));
+				                                           entry_ir.IMul(index_vertex, index_bytes));
 				const auto index_resource = entry_ir.Emit(
 				    IR::ValueOpcode::GetAddressResource,
 				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
