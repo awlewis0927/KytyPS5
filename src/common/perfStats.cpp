@@ -329,6 +329,11 @@ void NoteWrittenRange(uint64_t address, uint64_t size) noexcept {
 }
 
 void NoteHotAddress(HotKind kind, uint64_t address) noexcept {
+	// "hot_pages=0" skips this per-fault bookkeeping (a global lock taken on every fault).
+	static const bool enabled = TweakEnabled("hot_pages", true);
+	if (!enabled) {
+		return;
+	}
 	const auto thread = CurrentThreadId();
 	std::lock_guard lock(g_hot_mutex);
 	auto& page = g_hot[static_cast<size_t>(kind)][address >> 12u];
