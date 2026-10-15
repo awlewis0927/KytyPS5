@@ -218,6 +218,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
+	++m_lookup_generation;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 }
@@ -245,6 +246,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	++m_lookup_generation;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1435,29 +1437,76 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
-	{
+	static const bool lookup_cache = PerfStats::TweakEnabled("image_lookup_cache", false);
+	const auto stencil_owner_match = [&](const Image& image) {
+		// Stencil descriptors name the associated plane; its depth owner supplies
+		// the native image and the canonical guest tiling.
+		return (desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+		       image.depth_id && image.info.data == desc.info.data &&
+		       m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+		       image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+		       image.info.resources.levels >= desc.info.resources.levels &&
+		       image.info.resources.layers >= desc.info.resources.layers &&
+		       desc.info.bytes_per_block == 1 &&
+		       desc.info.guest_format == Prospero::BufferFormat::k8UInt;
+	};
+	const auto lookup_slot = [&]() -> LookupEntry& {
+		uint64_t key = desc.info.data.address * 0x9E3779B97F4A7C15ull;
+		key ^= desc.info.data.size + (static_cast<uint64_t>(desc.type) << 56) +
+		       (static_cast<uint64_t>(desc.info.pixel_format) << 20) + (exact_format ? 1u : 0u);
+		key *= 0xBF58476D1CE4E5B9ull;
+		return m_lookup_cache[(key >> 40) & (m_lookup_cache.size() - 1)];
+	};
+	const auto lookup_matches = [&](const LookupEntry& entry) {
+		return entry.generation == m_lookup_generation &&
+		       entry.address == desc.info.data.address && entry.size == desc.info.data.size &&
+		       entry.format == desc.info.pixel_format &&
+		       entry.type == static_cast<uint32_t>(desc.type) && entry.exact == exact_format;
+	};
+	if (lookup_cache) {
+		std::scoped_lock lock {m_lock};
+		auto&            entry = lookup_slot();
+		if (lookup_matches(entry)) {
+			// No registration changed since the entry was stored, so the region still holds
+			// exactly this image; re-run the full single-candidate decision on its current state.
+			auto* image = m_slot_images.try_get(entry.id);
+			bool  hit   = false;
+			if (image != nullptr && image->registered) {
+				if (stencil_owner_match(*image)) {
+					hit = true;
+				} else if (SameBacking(image->info, desc.info, exact_format)) {
+					hit = image->depth_id ||
+					      ((!exact_format || image->info.pixel_format == desc.info.pixel_format) &&
+					       !(image->info.resources < desc.info.resources));
+				}
+			}
+			if (hit) {
+				result                    = entry.id;
+				image->tick_accessed_last = m_scheduler.CurrentTick();
+				TouchImage(*image);
+				PerfStats::Add(PerfStats::Counter::ImageLookupHits);
+			} else {
+				entry.generation = 0;
+			}
+		}
+	}
+	if (!result) {
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-		bool block_alias = false;
+		bool block_alias    = false;
+		bool direct_match   = false;
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
-			// Stencil descriptors name the associated plane; its depth owner supplies
-			// the native image and the canonical guest tiling.
-			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
-			    image.depth_id && image.info.data == desc.info.data &&
-			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
-			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
-			    image.info.resources.levels >= desc.info.resources.levels &&
-			    image.info.resources.layers >= desc.info.resources.layers &&
-			    desc.info.bytes_per_block == 1 &&
-			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+			if (stencil_owner_match(image)) {
 				result = id;
+				direct_match = true;
 				break;
 			}
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
+				direct_match = true;
 			} else if (image.SafeToDownload() &&
 			           BcAlias::Matches(desc.info, image.info)) {
 				block_alias = true;
@@ -1497,6 +1546,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				FreeImage(result);
 				result = {};
 			}
+		}
+		if (lookup_cache && result && direct_match && candidates.size() == 1) {
+			auto& entry      = lookup_slot();
+			entry.address    = desc.info.data.address;
+			entry.size       = desc.info.data.size;
+			entry.format     = desc.info.pixel_format;
+			entry.type       = static_cast<uint32_t>(desc.type);
+			entry.exact      = exact_format;
+			entry.id         = result;
+			entry.generation = m_lookup_generation;
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);

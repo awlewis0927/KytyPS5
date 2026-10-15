@@ -198,6 +198,19 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// "image_lookup_cache": remembers FindImage results whose region held a single image. Any
+	// image registration change bumps the generation and invalidates every entry.
+	struct LookupEntry {
+		uint64_t   address    = 0;
+		uint64_t   size       = 0;
+		uint64_t   generation = 0;
+		vk::Format format     = vk::Format::eUndefined;
+		uint32_t   type       = 0;
+		bool       exact      = false;
+		ImageId    id {};
+	};
+	std::array<LookupEntry, 4096> m_lookup_cache {};
+	uint64_t                      m_lookup_generation = 1;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
