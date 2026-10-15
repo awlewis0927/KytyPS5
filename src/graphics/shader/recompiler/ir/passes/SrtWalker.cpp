@@ -2,7 +2,6 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/perfStats.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -43,10 +42,13 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 // "srt_fast": the walker reads one DWORD at a time, so a table walk records hundreds of
 // adjacent 4-byte ranges that every draw then tests against every written range. Adjacent or
 // repeated reads are merged into the previous range; overlap tests see the same union.
+static bool g_merge_read_ranges = false;
+
+void SetSrtRangeMerge(bool enabled) { g_merge_read_ranges = enabled; }
+
 static void RecordRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t address,
                         uint64_t size) {
-	static const bool merge = PerfStats::TweakEnabled("srt_fast", false);
-	if (merge && !ranges.empty() && size != 0) {
+	if (g_merge_read_ranges && !ranges.empty() && size != 0) {
 		auto& last = ranges.back();
 		const auto last_end = last.first + last.second;
 		if (last.second != 0 && address >= last.first && address <= last_end) {

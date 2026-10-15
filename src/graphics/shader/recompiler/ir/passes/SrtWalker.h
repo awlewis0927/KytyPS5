@@ -46,6 +46,8 @@ enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 void CompileSrtWalker(ResourcePlan& program);
+// "srt_fast": merge adjacent captured read ranges (set once by the renderer).
+void SetSrtRangeMerge(bool enabled);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
